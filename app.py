@@ -122,6 +122,8 @@ def compute_ytd_by_trading_day(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     A differenza del DOY, il TDI conta solo i giorni di trading effettivi (1, 2, 3, ...)
     eliminando i problemi di disallineamento da anni bisestili e festività variabili.
     
+    La base YTD è sempre l'ultimo prezzo dell'anno precedente (convenzione standard).
+    
     Returns:
         - pivot_ytd: DataFrame TDI × anni con rendimenti YTD %
         - pivot_returns: DataFrame TDI × anni con rendimenti giornalieri %
@@ -138,20 +140,23 @@ def compute_ytd_by_trading_day(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     
     ytd_dict = {}
     returns_dict = {}
-    metadata = {"last_valid_tdi": {}, "tdi_to_date": {}}
+    metadata = {"last_valid_tdi": {}, "tdi_to_date": {}, "base_prices": {}}
     
     for anno in anni:
-        # Prezzo base: ultima chiusura dell'anno precedente
+        df_anno = df[df["year"] == anno].copy().reset_index(drop=True)
+        
+        # Base YTD: ultimo prezzo dell'anno precedente
         anno_prec = anno - 1
         df_prec = df[df["year"] == anno_prec]
         
         if df_prec.empty:
-            # Primo anno: usa primo prezzo come base
-            base_price = df[df["year"] == anno]["adjusted_close"].iloc[0]
+            # Primo anno disponibile: usa primo prezzo come base
+            base_price = df_anno["adjusted_close"].iloc[0]
         else:
             base_price = df_prec["adjusted_close"].iloc[-1]
         
-        df_anno = df[df["year"] == anno].copy().reset_index(drop=True)
+        # Salva base price per debug
+        metadata["base_prices"][anno] = base_price
         
         # Trading Day Index: 1-based, conta solo giorni di trading effettivi
         df_anno["tdi"] = np.arange(1, len(df_anno) + 1)
@@ -1373,6 +1378,40 @@ def main():
     if df.empty:
         st.error(f"❌ Nessun dato disponibile per **{ticker}**. Verifica il simbolo.")
         st.stop()
+    
+    # ---- VALIDAZIONE CRITICA: Verifica che l'anno corrente sia nei dati ----
+    df["year"] = df["date"].dt.year
+    anni_nei_dati = sorted(df["year"].unique())
+    ultimo_anno_dati = anni_nei_dati[-1]
+    ultima_data_dati = df["date"].max()
+    
+    if current_year not in anni_nei_dati:
+        st.error(f"""
+        ❌ **DATI NON AGGIORNATI**
+        
+        Oggi è il **{date.today().strftime('%d/%m/%Y')}** (anno {current_year}), 
+        ma i dati EODHD arrivano solo fino al **{ultima_data_dati.strftime('%d/%m/%Y')}** (anno {ultimo_anno_dati}).
+        
+        La dashboard sta mostrando dati dell'anno **{ultimo_anno_dati}**, non dell'anno corrente.
+        
+        Verifica:
+        - Che la tua API key EODHD sia valida e attiva
+        - Che il ticker `{ticker}` sia corretto
+        - Che EODHD abbia dati aggiornati per questo asset
+        """)
+        # Permetti comunque di continuare con l'ultimo anno disponibile
+        st.warning(f"⚠️ Proseguo con l'analisi dell'anno **{ultimo_anno_dati}** come anno di riferimento.")
+        current_year = ultimo_anno_dati
+    
+    # Mostra info sui dati disponibili
+    with st.expander("📅 Range Dati Disponibili", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Prima data", df["date"].min().strftime("%Y-%m-%d"))
+        with col2:
+            st.metric("Ultima data", ultima_data_dati.strftime("%Y-%m-%d"))
+        with col3:
+            st.metric("Anni totali", len(anni_nei_dati))
 
     # ---- Core Computations ----
     with st.spinner("Elaborazione dati..."):
@@ -1382,6 +1421,55 @@ def main():
         if len(anni_disponibili) < 3:
             st.error("❌ Storico insufficiente: servono almeno 3 anni di dati.")
             st.stop()
+        
+        # DEBUG: Mostra info sul calcolo base per l'anno corrente
+        with st.expander("🔍 Debug: Verifica Calcolo YTD", expanded=False):
+            # Info dal metadata
+            base_price_used = metadata["base_prices"].get(current_year, None)
+            
+            df_anno_prec = df[df["year"] == current_year - 1]
+            df_anno_curr = df[df["year"] == current_year]
+            
+            if not df_anno_prec.empty and not df_anno_curr.empty:
+                last_price_prev = df_anno_prec["adjusted_close"].iloc[-1]
+                last_date_prev = df_anno_prec["date"].iloc[-1]
+                first_price_curr = df_anno_curr["adjusted_close"].iloc[0]
+                first_date_curr = df_anno_curr["date"].iloc[0]
+                current_price = df_anno_curr["adjusted_close"].iloc[-1]
+                current_date = df_anno_curr["date"].iloc[-1]
+                
+                st.markdown("#### 📊 Prezzi Chiave")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric(
+                        f"Ultimo {current_year-1}",
+                        f"${last_price_prev:.2f}",
+                        help=f"Data: {last_date_prev.strftime('%Y-%m-%d')}"
+                    )
+                with col2:
+                    st.metric(
+                        f"Primo {current_year}",
+                        f"${first_price_curr:.2f}",
+                        help=f"Data: {first_date_curr.strftime('%Y-%m-%d')}"
+                    )
+                with col3:
+                    st.metric(
+                        f"Ultimo {current_year}",
+                        f"${current_price:.2f}",
+                        help=f"Data: {current_date.strftime('%Y-%m-%d')}"
+                    )
+                
+                st.markdown("#### 🧮 Calcolo YTD")
+                
+                ytd_calc = (current_price / last_price_prev - 1) * 100
+                
+                st.code(f"YTD = ({current_price:.2f} / {last_price_prev:.2f} - 1) × 100 = {ytd_calc:.2f}%")
+                st.markdown(f"**Base usata (ultimo close {current_year-1}):** ${base_price_used:.2f}" if base_price_used else "N/D")
+                
+            elif df_anno_curr.empty:
+                st.error(f"⚠️ Nessun dato per l'anno {current_year}!")
+            else:
+                st.warning(f"Dati anno {current_year-1} non disponibili - usato primo prezzo {current_year} come base")
         
         perc = compute_percentiles(pivot_ytd, current_year)
         pct_attuale, ultimo_tdi = compute_current_percentile(pivot_ytd, current_year, metadata)
