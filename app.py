@@ -122,7 +122,8 @@ def compute_ytd_by_trading_day(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     A differenza del DOY, il TDI conta solo i giorni di trading effettivi (1, 2, 3, ...)
     eliminando i problemi di disallineamento da anni bisestili e festività variabili.
     
-    La base YTD è sempre l'ultimo prezzo dell'anno precedente (convenzione standard).
+    La base YTD è il PRIMO prezzo dell'anno corrente (convenzione TradingView/standard di mercato).
+    Questo evita distorsioni da gap di capodanno (specialmente rilevante per Forex/Crypto).
     
     Returns:
         - pivot_ytd: DataFrame TDI × anni con rendimenti YTD %
@@ -150,23 +151,20 @@ def compute_ytd_by_trading_day(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     for anno in anni:
         df_anno = df[df["year"] == anno].copy().reset_index(drop=True)
         
-        # Base YTD: ultimo prezzo dell'anno precedente
-        anno_prec = anno - 1
-        df_prec = df[df["year"] == anno_prec]
+        # Base YTD: PRIMO prezzo dell'anno corrente (convenzione TradingView)
+        # Questo è lo standard di mercato e evita distorsioni da gap di capodanno
+        base_price = df_anno["adjusted_close"].iloc[0]
+        base_date = df_anno["date"].iloc[0]
         
-        if df_prec.empty:
-            # Primo anno disponibile: usa primo prezzo come base
-            base_price = df_anno["adjusted_close"].iloc[0]
-        else:
-            base_price = df_prec["adjusted_close"].iloc[-1]
-        
-        # Salva base price per debug
+        # Salva base price e data per debug
         metadata["base_prices"][anno] = base_price
+        metadata["base_dates"] = metadata.get("base_dates", {})
+        metadata["base_dates"][anno] = base_date
         
         # Trading Day Index: 1-based, conta solo giorni di trading effettivi
         df_anno["tdi"] = np.arange(1, len(df_anno) + 1)
         
-        # Rendimento YTD cumulato
+        # Rendimento YTD cumulato (il primo giorno è sempre 0% per definizione)
         df_anno["ytd_pct"] = (df_anno["adjusted_close"] / base_price - 1) * 100
         
         # Crea serie con TDI come indice (usa max_trading_days dinamico)
@@ -1361,9 +1359,10 @@ def main():
         st.markdown("##### ℹ️ Note Tecniche")
         st.caption("""
         - **TDI**: Trading Day Index (evita bias da anni bisestili)
+        - **Base YTD**: Primo prezzo dell'anno (convenzione TradingView)
         - **Max DD**: Calcolato geometricamente
-        - **Volatilità**: Su rendimenti giornalieri (non YTD cumulato)
-        - **Forward**: Gestisce cross-year
+        - **Volatilità**: Su rendimenti giornalieri
+        - **Forward**: Gestisce cross-year con compounding
         """)
 
     # ---- Header ----
@@ -1436,50 +1435,55 @@ def main():
         with st.expander("🔍 Debug: Verifica Calcolo YTD", expanded=False):
             # Info dal metadata
             base_price_used = metadata["base_prices"].get(current_year, None)
+            base_date_used = metadata.get("base_dates", {}).get(current_year, None)
             
-            df_anno_prec = df[df["year"] == current_year - 1]
             df_anno_curr = df[df["year"] == current_year]
             
-            if not df_anno_prec.empty and not df_anno_curr.empty:
-                last_price_prev = df_anno_prec["adjusted_close"].iloc[-1]
-                last_date_prev = df_anno_prec["date"].iloc[-1]
+            if not df_anno_curr.empty:
                 first_price_curr = df_anno_curr["adjusted_close"].iloc[0]
                 first_date_curr = df_anno_curr["date"].iloc[0]
                 current_price = df_anno_curr["adjusted_close"].iloc[-1]
                 current_date = df_anno_curr["date"].iloc[-1]
                 
                 st.markdown("#### 📊 Prezzi Chiave")
-                col1, col2, col3 = st.columns(3)
+                st.caption("**Convenzione YTD:** Primo prezzo dell'anno (standard TradingView)")
+                
+                col1, col2 = st.columns(2)
                 with col1:
                     st.metric(
-                        f"Ultimo {current_year-1}",
-                        f"${last_price_prev:.2f}",
-                        help=f"Data: {last_date_prev.strftime('%Y-%m-%d')}"
+                        f"Base YTD (primo close {current_year})",
+                        f"${first_price_curr:.4f}",
+                        help=f"Data: {first_date_curr.strftime('%Y-%m-%d')}"
                     )
                 with col2:
                     st.metric(
-                        f"Primo {current_year}",
-                        f"${first_price_curr:.2f}",
-                        help=f"Data: {first_date_curr.strftime('%Y-%m-%d')}"
-                    )
-                with col3:
-                    st.metric(
-                        f"Ultimo {current_year}",
-                        f"${current_price:.2f}",
+                        f"Ultimo prezzo",
+                        f"${current_price:.4f}",
                         help=f"Data: {current_date.strftime('%Y-%m-%d')}"
                     )
                 
                 st.markdown("#### 🧮 Calcolo YTD")
                 
-                ytd_calc = (current_price / last_price_prev - 1) * 100
+                ytd_calc = (current_price / first_price_curr - 1) * 100
                 
-                st.code(f"YTD = ({current_price:.2f} / {last_price_prev:.2f} - 1) × 100 = {ytd_calc:.2f}%")
-                st.markdown(f"**Base usata (ultimo close {current_year-1}):** ${base_price_used:.2f}" if base_price_used else "N/D")
+                st.code(f"YTD = ({current_price:.4f} / {first_price_curr:.4f} - 1) × 100 = {ytd_calc:.4f}%")
                 
-            elif df_anno_curr.empty:
-                st.error(f"⚠️ Nessun dato per l'anno {current_year}!")
+                # Mostra anche il gap di capodanno per trasparenza
+                df_anno_prec = df[df["year"] == current_year - 1]
+                if not df_anno_prec.empty:
+                    last_price_prev = df_anno_prec["adjusted_close"].iloc[-1]
+                    last_date_prev = df_anno_prec["date"].iloc[-1]
+                    gap_pct = (first_price_curr / last_price_prev - 1) * 100
+                    
+                    st.info(f"""
+                    📈 **Gap di capodanno** (escluso dal YTD):
+                    - Ultimo close {current_year-1}: ${last_price_prev:.4f} ({last_date_prev.strftime('%Y-%m-%d')})
+                    - Primo close {current_year}: ${first_price_curr:.4f} ({first_date_curr.strftime('%Y-%m-%d')})
+                    - Gap: **{gap_pct:+.4f}%**
+                    """)
+                
             else:
-                st.warning(f"Dati anno {current_year-1} non disponibili - usato primo prezzo {current_year} come base")
+                st.error(f"⚠️ Nessun dato per l'anno {current_year}!")
         
         perc = compute_percentiles(pivot_ytd, current_year)
         pct_attuale, ultimo_tdi = compute_current_percentile(pivot_ytd, current_year, metadata)
