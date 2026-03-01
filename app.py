@@ -17,6 +17,9 @@ Features:
 
 Fonte dati: EODHD API (Adjusted Close giornaliero)
 Deploy: Streamlit Community Cloud (chiave API via st.secrets)
+
+NOTA: Utilizza Trading Day Index (TDI) invece di Day-of-Year per evitare
+      disallineamenti da anni bisestili.
 =============================================================================
 """
 
@@ -48,6 +51,9 @@ st.set_page_config(
 # COSTANTI E PALETTE COLORI
 # =============================================================================
 EODHD_BASE_URL = "https://eodhd.com/api/eod"
+
+# Numero tipico di trading days in un anno (US market)
+MAX_TRADING_DAYS = 253
 
 # Palette colori Kriterion Quant
 COLORS = {
@@ -107,42 +113,77 @@ def fetch_ohlcv(ticker: str, start_date: str) -> pd.DataFrame:
 
 
 # =============================================================================
-# 2. CALCOLO YTD E MAPPATURA SU DAY OF YEAR (DOY)
+# 2. CALCOLO YTD CON TRADING DAY INDEX (TDI)
 # =============================================================================
-def compute_ytd_by_doy(df: pd.DataFrame) -> pd.DataFrame:
+def compute_ytd_by_trading_day(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
-    Calcola i rendimenti YTD per ogni anno solare mappati su DOY 1-366.
+    Calcola i rendimenti YTD per ogni anno solare mappati su Trading Day Index (TDI).
+    
+    A differenza del DOY, il TDI conta solo i giorni di trading effettivi (1, 2, 3, ...)
+    eliminando i problemi di disallineamento da anni bisestili e festività variabili.
+    
+    Returns:
+        - pivot_ytd: DataFrame TDI × anni con rendimenti YTD %
+        - pivot_returns: DataFrame TDI × anni con rendimenti giornalieri %
+        - metadata: dict con informazioni su ultimo TDI valido per anno
     """
     df = df.copy()
     df["year"] = df["date"].dt.year
-    df["doy"] = df["date"].dt.day_of_year
-
+    
     anni = sorted(df["year"].unique())
+    
     ytd_dict = {}
-
+    returns_dict = {}
+    metadata = {"last_valid_tdi": {}, "tdi_to_date": {}}
+    
     for anno in anni:
+        # Prezzo base: ultima chiusura dell'anno precedente
         anno_prec = anno - 1
         df_prec = df[df["year"] == anno_prec]
-
+        
         if df_prec.empty:
+            # Primo anno: usa primo prezzo come base
             base_price = df[df["year"] == anno]["adjusted_close"].iloc[0]
         else:
             base_price = df_prec["adjusted_close"].iloc[-1]
-
-        df_anno = df[df["year"] == anno].copy()
+        
+        df_anno = df[df["year"] == anno].copy().reset_index(drop=True)
+        
+        # Trading Day Index: 1-based, conta solo giorni di trading effettivi
+        df_anno["tdi"] = np.arange(1, len(df_anno) + 1)
+        
+        # Rendimento YTD cumulato
         df_anno["ytd_pct"] = (df_anno["adjusted_close"] / base_price - 1) * 100
-
-        serie_doy = pd.Series(
-            data=df_anno["ytd_pct"].values,
-            index=df_anno["doy"].values,
-        )
-        serie_full = serie_doy.reindex(range(1, 367))
-        serie_full = serie_full.ffill()
-
-        ytd_dict[anno] = serie_full
-
-    pivot = pd.DataFrame(ytd_dict)
-    return pivot
+        
+        # Rendimenti giornalieri (per volatilità) - calcolati sui PREZZI, non su YTD
+        df_anno["daily_return"] = df_anno["adjusted_close"].pct_change() * 100
+        
+        # Crea serie con TDI come indice
+        max_tdi = df_anno["tdi"].max()
+        
+        # Serie YTD - riempita SOLO fino all'ultimo TDI reale, poi NaN
+        serie_ytd = pd.Series(index=range(1, MAX_TRADING_DAYS + 1), dtype=float)
+        serie_ytd.loc[df_anno["tdi"]] = df_anno["ytd_pct"].values
+        # Forward fill SOLO fino all'ultimo trading day reale (per weekend/festività infrasettimanali)
+        # Ma NON oltre l'ultimo giorno di trading dell'anno
+        serie_ytd.loc[:max_tdi] = serie_ytd.loc[:max_tdi].ffill()
+        # I giorni oltre max_tdi rimangono NaN (cruciale per anno corrente)
+        
+        # Serie returns giornalieri
+        serie_returns = pd.Series(index=range(1, MAX_TRADING_DAYS + 1), dtype=float)
+        serie_returns.loc[df_anno["tdi"]] = df_anno["daily_return"].values
+        
+        ytd_dict[anno] = serie_ytd
+        returns_dict[anno] = serie_returns
+        
+        # Metadata
+        metadata["last_valid_tdi"][anno] = max_tdi
+        metadata["tdi_to_date"][anno] = dict(zip(df_anno["tdi"], df_anno["date"]))
+    
+    pivot_ytd = pd.DataFrame(ytd_dict)
+    pivot_returns = pd.DataFrame(returns_dict)
+    
+    return pivot_ytd, pivot_returns, metadata
 
 
 # =============================================================================
@@ -151,58 +192,78 @@ def compute_ytd_by_doy(df: pd.DataFrame) -> pd.DataFrame:
 def compute_percentiles(pivot: pd.DataFrame, current_year: int) -> pd.DataFrame:
     """
     Calcola percentili 5°, 25°, 50°, 75°, 95° escludendo l'anno corrente.
+    Considera solo i TDI con almeno N anni di dati validi.
     """
     storico = pivot.drop(columns=[current_year], errors="ignore")
-
+    
+    # Richiedi almeno 3 anni di dati per ogni TDI
+    min_years = 3
+    valid_mask = storico.notna().sum(axis=1) >= min_years
+    
     perc = pd.DataFrame(index=pivot.index)
-    perc["p5"] = storico.quantile(0.05, axis=1)
-    perc["p25"] = storico.quantile(0.25, axis=1)
-    perc["p50"] = storico.quantile(0.50, axis=1)
-    perc["p75"] = storico.quantile(0.75, axis=1)
-    perc["p95"] = storico.quantile(0.95, axis=1)
-
+    perc["p5"] = storico.quantile(0.05, axis=1).where(valid_mask)
+    perc["p25"] = storico.quantile(0.25, axis=1).where(valid_mask)
+    perc["p50"] = storico.quantile(0.50, axis=1).where(valid_mask)
+    perc["p75"] = storico.quantile(0.75, axis=1).where(valid_mask)
+    perc["p95"] = storico.quantile(0.95, axis=1).where(valid_mask)
+    
     return perc
 
 
 # =============================================================================
-# 4. CALCOLO PERCENTILE CORRENTE
+# 4. CALCOLO PERCENTILE CORRENTE (SENZA LOOKAHEAD BIAS)
 # =============================================================================
-def compute_current_percentile(pivot: pd.DataFrame, current_year: int) -> float:
+def compute_current_percentile(pivot: pd.DataFrame, current_year: int, 
+                                metadata: dict) -> tuple[float, int]:
     """
     Percentile dell'YTD corrente rispetto alla distribuzione storica.
+    Usa l'ultimo TDI REALE dell'anno corrente, non il forward-filled.
+    
+    Returns:
+        - percentile: valore 0-100
+        - ultimo_tdi: ultimo trading day index con dati reali
     """
     serie_ytd_corrente = pivot.get(current_year)
     if serie_ytd_corrente is None:
-        return np.nan
-
-    ultimo_doy = serie_ytd_corrente.last_valid_index()
-    if ultimo_doy is None:
-        return np.nan
-
-    valore_corrente = serie_ytd_corrente.loc[ultimo_doy]
-
+        return np.nan, 0
+    
+    # Usa metadata per trovare l'ultimo TDI reale (non forward-filled)
+    ultimo_tdi = metadata["last_valid_tdi"].get(current_year, 0)
+    if ultimo_tdi == 0:
+        return np.nan, 0
+    
+    valore_corrente = serie_ytd_corrente.loc[ultimo_tdi]
+    if pd.isna(valore_corrente):
+        return np.nan, ultimo_tdi
+    
     storico = pivot.drop(columns=[current_year], errors="ignore")
-    valori_storici = storico.loc[ultimo_doy].dropna().values
-
+    
+    # Prendi valori storici allo STESSO TDI
+    valori_storici = storico.loc[ultimo_tdi].dropna().values
+    
     if len(valori_storici) == 0:
-        return np.nan
-
+        return np.nan, ultimo_tdi
+    
     percentile = (np.sum(valori_storici < valore_corrente) / len(valori_storici)) * 100
-    return round(percentile, 1)
+    return round(percentile, 1), ultimo_tdi
 
 
 # =============================================================================
-# 5. Z-SCORE DINAMICO
+# 5. Z-SCORE DINAMICO (CORRETTO)
 # =============================================================================
-def compute_zscore_by_doy(pivot: pd.DataFrame, current_year: int) -> pd.Series:
+def compute_zscore_by_tdi(pivot: pd.DataFrame, current_year: int, 
+                          metadata: dict) -> pd.Series:
     """
-    Z-score dell'YTD corrente vs distribuzione storica per ogni DOY.
+    Z-score dell'YTD corrente vs distribuzione storica per ogni TDI.
+    Considera SOLO fino all'ultimo TDI reale dell'anno corrente.
     """
     storico = pivot.drop(columns=[current_year], errors="ignore")
     serie_corrente = pivot.get(current_year)
     
     if serie_corrente is None:
         return pd.Series(dtype=float)
+    
+    ultimo_tdi = metadata["last_valid_tdi"].get(current_year, 0)
     
     mu = storico.mean(axis=1)
     sigma = storico.std(axis=1)
@@ -211,29 +272,38 @@ def compute_zscore_by_doy(pivot: pd.DataFrame, current_year: int) -> pd.Series:
     sigma = sigma.replace(0, np.nan)
     
     zscore = (serie_corrente - mu) / sigma
+    
+    # Tronca oltre l'ultimo TDI reale
+    zscore.loc[ultimo_tdi + 1:] = np.nan
+    
     return zscore
 
 
-def compute_rolling_volatility_context(pivot: pd.DataFrame, current_year: int, window: int = 20) -> pd.DataFrame:
+def compute_rolling_volatility_context(pivot_returns: pd.DataFrame, current_year: int,
+                                        metadata: dict, window: int = 20) -> pd.DataFrame:
     """
     Calcola la volatilità rolling dell'anno corrente vs media storica.
+    USA I RENDIMENTI GIORNALIERI (non il YTD cumulato).
     """
-    storico = pivot.drop(columns=[current_year], errors="ignore")
-    serie_corrente = pivot.get(current_year)
+    storico = pivot_returns.drop(columns=[current_year], errors="ignore")
+    serie_corrente = pivot_returns.get(current_year)
     
     if serie_corrente is None:
         return pd.DataFrame()
     
-    # Volatilità rolling anno corrente (su returns giornalieri)
-    returns_corrente = serie_corrente.diff()
-    vol_corrente = returns_corrente.rolling(window=window, min_periods=5).std()
+    ultimo_tdi = metadata["last_valid_tdi"].get(current_year, 0)
     
-    # Volatilità media storica per DOY
+    # Volatilità rolling anno corrente (su returns giornalieri veri)
+    vol_corrente = serie_corrente.rolling(window=window, min_periods=5).std()
+    
+    # Volatilità media storica per TDI
     vol_storica_list = []
     for anno in storico.columns:
-        returns_anno = storico[anno].diff()
-        vol_anno = returns_anno.rolling(window=window, min_periods=5).std()
+        vol_anno = storico[anno].rolling(window=window, min_periods=5).std()
         vol_storica_list.append(vol_anno)
+    
+    if len(vol_storica_list) == 0:
+        return pd.DataFrame()
     
     vol_storica_df = pd.concat(vol_storica_list, axis=1)
     vol_storica_mean = vol_storica_df.mean(axis=1)
@@ -246,13 +316,17 @@ def compute_rolling_volatility_context(pivot: pd.DataFrame, current_year: int, w
         "vol_zscore": (vol_corrente - vol_storica_mean) / vol_storica_std.replace(0, np.nan),
     })
     
+    # Tronca oltre l'ultimo TDI reale
+    result.loc[ultimo_tdi + 1:] = np.nan
+    
     return result
 
 
 # =============================================================================
 # 6. VELOCITÀ E ACCELERAZIONE ANOMALIA
 # =============================================================================
-def compute_percentile_dynamics(pivot: pd.DataFrame, current_year: int, window: int = 5) -> pd.DataFrame:
+def compute_percentile_dynamics(pivot: pd.DataFrame, current_year: int, 
+                                 metadata: dict, window: int = 5) -> pd.DataFrame:
     """
     Calcola il percentile rolling, la sua velocità e accelerazione.
     """
@@ -261,14 +335,18 @@ def compute_percentile_dynamics(pivot: pd.DataFrame, current_year: int, window: 
         return pd.DataFrame()
     
     storico = pivot.drop(columns=[current_year], errors="ignore")
+    ultimo_tdi = metadata["last_valid_tdi"].get(current_year, 0)
     
-    # Calcola percentile per ogni DOY
+    # Calcola percentile per ogni TDI (solo fino all'ultimo reale)
     pct_series = pd.Series(index=serie.index, dtype=float)
-    for doy in serie.dropna().index:
-        val = serie.loc[doy]
-        hist_vals = storico.loc[doy].dropna()
+    
+    for tdi in range(1, ultimo_tdi + 1):
+        val = serie.loc[tdi]
+        if pd.isna(val):
+            continue
+        hist_vals = storico.loc[tdi].dropna()
         if len(hist_vals) > 0:
-            pct_series.loc[doy] = (hist_vals < val).sum() / len(hist_vals) * 100
+            pct_series.loc[tdi] = (hist_vals < val).sum() / len(hist_vals) * 100
     
     velocity = pct_series.diff(window)
     acceleration = velocity.diff(window)
@@ -285,15 +363,20 @@ def compute_percentile_dynamics(pivot: pd.DataFrame, current_year: int, window: 
 # =============================================================================
 # 7. PERSISTENZA ANOMALIA
 # =============================================================================
-def compute_anomaly_persistence(pivot: pd.DataFrame, perc: pd.DataFrame, current_year: int) -> dict:
+def compute_anomaly_persistence(pivot: pd.DataFrame, perc: pd.DataFrame, 
+                                 current_year: int, metadata: dict) -> dict:
     """
     Calcola giorni consecutivi fuori dall'IQR e statistiche correlate.
     """
     serie = pivot.get(current_year)
     if serie is None:
-        return {"current_streak": 0, "max_streak": 0, "total_days_outside": 0, "streaks": pd.Series(dtype=int)}
+        return {"current_streak": 0, "max_streak": 0, "total_days_outside": 0, 
+                "pct_days_outside": 0, "direction": "unknown", "streaks": pd.Series(dtype=int)}
     
-    serie = serie.dropna()
+    ultimo_tdi = metadata["last_valid_tdi"].get(current_year, 0)
+    
+    # Considera solo fino all'ultimo TDI reale
+    serie = serie.loc[:ultimo_tdi].dropna()
     p25 = perc["p25"].loc[serie.index]
     p75 = perc["p75"].loc[serie.index]
     
@@ -313,10 +396,10 @@ def compute_anomaly_persistence(pivot: pd.DataFrame, perc: pd.DataFrame, current
     # Direzione anomalia corrente
     if len(serie) > 0:
         last_val = serie.iloc[-1]
-        last_doy = serie.index[-1]
-        if last_val < p25.loc[last_doy]:
+        last_tdi = serie.index[-1]
+        if last_val < p25.loc[last_tdi]:
             direction = "below"
-        elif last_val > p75.loc[last_doy]:
+        elif last_val > p75.loc[last_tdi]:
             direction = "above"
         else:
             direction = "within"
@@ -335,23 +418,61 @@ def compute_anomaly_persistence(pivot: pd.DataFrame, perc: pd.DataFrame, current
 
 
 # =============================================================================
-# 8. REGIME CLUSTERING
+# 8. REGIME CLUSTERING (CON MAX DRAWDOWN GEOMETRICO CORRETTO)
 # =============================================================================
-def cluster_historical_years(pivot: pd.DataFrame, current_year: int, n_clusters: int = 3) -> pd.DataFrame:
+def compute_geometric_max_drawdown(ytd_series: pd.Series) -> float:
+    """
+    Calcola il Maximum Drawdown GEOMETRICO corretto.
+    
+    Converte il rendimento YTD % in equity curve (base 100),
+    poi calcola DD = (peak - current) / peak.
+    """
+    # Converti YTD % in equity curve
+    equity = 100 * (1 + ytd_series.dropna() / 100)
+    
+    if len(equity) == 0:
+        return 0.0
+    
+    # Running maximum (peak)
+    running_max = equity.cummax()
+    
+    # Drawdown percentuale geometrico
+    drawdown = (equity - running_max) / running_max * 100
+    
+    # Max drawdown (valore più negativo)
+    max_dd = drawdown.min()
+    
+    return max_dd
+
+
+def cluster_historical_years(pivot_ytd: pd.DataFrame, pivot_returns: pd.DataFrame,
+                              current_year: int, n_clusters: int = 3) -> pd.DataFrame:
     """
     Clustering degli anni storici per regime (bull/bear/sideways).
+    Usa volatilità calcolata sui RENDIMENTI GIORNALIERI e Max DD GEOMETRICO.
     """
-    storico = pivot.drop(columns=[current_year], errors="ignore")
+    storico_ytd = pivot_ytd.drop(columns=[current_year], errors="ignore")
+    storico_returns = pivot_returns.drop(columns=[current_year], errors="ignore")
     
-    if storico.shape[1] < n_clusters:
+    if storico_ytd.shape[1] < n_clusters:
         return pd.DataFrame()
     
     # Features per anno
-    features = pd.DataFrame(index=storico.columns)
-    features["final_ret"] = storico.iloc[-1]
-    features["path_vol"] = storico.diff().std()
-    features["max_dd"] = storico.apply(lambda x: (x - x.cummax()).min())
-    features["sharpe_proxy"] = features["final_ret"] / features["path_vol"].replace(0, np.nan)
+    features = pd.DataFrame(index=storico_ytd.columns)
+    
+    # Rendimento finale (ultimo valore non-NaN)
+    features["final_ret"] = storico_ytd.apply(lambda x: x.dropna().iloc[-1] if len(x.dropna()) > 0 else np.nan)
+    
+    # Volatilità calcolata sui RENDIMENTI GIORNALIERI (non sul YTD cumulato)
+    features["path_vol"] = storico_returns.std()
+    
+    # Max Drawdown GEOMETRICO corretto
+    features["max_dd"] = storico_ytd.apply(compute_geometric_max_drawdown)
+    
+    # Sharpe proxy annualizzato
+    mean_daily_ret = storico_returns.mean()
+    std_daily_ret = storico_returns.std()
+    features["sharpe_proxy"] = (mean_daily_ret * 252) / (std_daily_ret * np.sqrt(252))
     
     features_clean = features.dropna()
     
@@ -377,33 +498,45 @@ def cluster_historical_years(pivot: pd.DataFrame, current_year: int, n_clusters:
     return features_clean
 
 
-def identify_current_regime(pivot: pd.DataFrame, current_year: int, cluster_df: pd.DataFrame) -> str:
+def identify_current_regime(pivot_ytd: pd.DataFrame, pivot_returns: pd.DataFrame,
+                             current_year: int, cluster_df: pd.DataFrame,
+                             metadata: dict) -> str:
     """
-    Identifica il regime più probabile dell'anno corrente basandosi sulle features YTD.
+    Identifica il regime più probabile dell'anno corrente.
     """
     if cluster_df.empty:
         return "Unknown"
     
-    serie_corrente = pivot.get(current_year)
-    if serie_corrente is None:
+    serie_ytd = pivot_ytd.get(current_year)
+    serie_returns = pivot_returns.get(current_year)
+    
+    if serie_ytd is None or serie_returns is None:
         return "Unknown"
     
-    serie_corrente = serie_corrente.dropna()
-    if len(serie_corrente) < 20:
+    ultimo_tdi = metadata["last_valid_tdi"].get(current_year, 0)
+    
+    if ultimo_tdi < 20:
         return "Insufficient Data"
     
-    # Calcola features correnti
-    current_ret = serie_corrente.iloc[-1]
-    current_vol = serie_corrente.diff().std()
-    current_dd = (serie_corrente - serie_corrente.cummax()).min()
+    # Calcola features correnti (solo fino all'ultimo TDI reale)
+    serie_ytd_valid = serie_ytd.loc[:ultimo_tdi].dropna()
+    serie_returns_valid = serie_returns.loc[:ultimo_tdi].dropna()
     
-    # Trova il regime più simile (nearest neighbor semplificato)
+    if len(serie_ytd_valid) < 20:
+        return "Insufficient Data"
+    
+    current_ret = serie_ytd_valid.iloc[-1]
+    current_vol = serie_returns_valid.std()
+    current_dd = compute_geometric_max_drawdown(serie_ytd_valid)
+    
+    # Trova il regime più simile (nearest neighbor)
     distances = []
     for _, row in cluster_df.iterrows():
+        # Normalizza le distanze
         dist = np.sqrt(
-            (current_ret - row["final_ret"])**2 +
-            (current_vol - row["path_vol"])**2 +
-            (current_dd - row["max_dd"])**2
+            ((current_ret - row["final_ret"]) / cluster_df["final_ret"].std())**2 +
+            ((current_vol - row["path_vol"]) / cluster_df["path_vol"].std())**2 +
+            ((current_dd - row["max_dd"]) / cluster_df["max_dd"].std())**2
         )
         distances.append((row["regime"], dist))
     
@@ -442,13 +575,15 @@ def compute_regime_conditional_percentiles(pivot: pd.DataFrame, current_year: in
 
 
 # =============================================================================
-# 9. FORWARD RETURNS & MEAN REVERSION
+# 9. FORWARD RETURNS (CON CROSS-YEAR HANDLING)
 # =============================================================================
 def compute_forward_return_distribution(pivot: pd.DataFrame, current_year: int, 
+                                         metadata: dict,
                                          lookahead_days: int = 20, 
                                          pct_tolerance: float = 10) -> dict:
     """
     Distribuzione dei rendimenti forward storici quando in anomalia simile.
+    GESTISCE CORRETTAMENTE il wrap-around tra anni.
     """
     storico = pivot.drop(columns=[current_year], errors="ignore")
     serie_corrente = pivot.get(current_year)
@@ -456,39 +591,70 @@ def compute_forward_return_distribution(pivot: pd.DataFrame, current_year: int,
     if serie_corrente is None:
         return {}
     
-    serie_corrente = serie_corrente.dropna()
-    if len(serie_corrente) == 0:
+    ultimo_tdi = metadata["last_valid_tdi"].get(current_year, 0)
+    if ultimo_tdi == 0:
         return {}
     
-    ultimo_doy = serie_corrente.index[-1]
-    current_val = serie_corrente.iloc[-1]
+    current_val = serie_corrente.loc[ultimo_tdi]
+    if pd.isna(current_val):
+        return {}
     
     # Calcola percentile corrente
-    hist_vals_at_doy = storico.loc[ultimo_doy].dropna()
-    if len(hist_vals_at_doy) == 0:
+    hist_vals_at_tdi = storico.loc[ultimo_tdi].dropna()
+    if len(hist_vals_at_tdi) == 0:
         return {}
     
-    current_pct = (hist_vals_at_doy < current_val).sum() / len(hist_vals_at_doy) * 100
+    current_pct = (hist_vals_at_tdi < current_val).sum() / len(hist_vals_at_tdi) * 100
     
-    # Trova anni storici con percentile simile a questo DOY
+    # Trova anni storici con percentile simile a questo TDI
     forward_rets = []
     matching_years = []
     
-    for anno in storico.columns:
-        val_doy = storico.loc[ultimo_doy, anno]
-        if pd.isna(val_doy):
+    anni_storici = sorted(storico.columns)
+    
+    for i, anno in enumerate(anni_storici):
+        val_tdi = storico.loc[ultimo_tdi, anno]
+        if pd.isna(val_tdi):
             continue
         
-        hist_pct = (hist_vals_at_doy < val_doy).sum() / len(hist_vals_at_doy) * 100
+        hist_pct = (hist_vals_at_tdi < val_tdi).sum() / len(hist_vals_at_tdi) * 100
         
         if abs(hist_pct - current_pct) <= pct_tolerance:
-            future_doy = min(ultimo_doy + lookahead_days, 366)
-            if future_doy in storico.index:
-                future_val = storico.loc[future_doy, anno]
+            # Calcola forward return
+            future_tdi = ultimo_tdi + lookahead_days
+            
+            if future_tdi <= MAX_TRADING_DAYS:
+                # Forward return nello stesso anno
+                future_val = storico.loc[future_tdi, anno]
                 if not pd.isna(future_val):
-                    fwd_ret = future_val - val_doy
+                    fwd_ret = future_val - val_tdi
                     forward_rets.append(fwd_ret)
                     matching_years.append(anno)
+            else:
+                # Cross-year: cerca nell'anno successivo
+                anno_next = anno + 1
+                if anno_next in storico.columns:
+                    # TDI nell'anno successivo
+                    tdi_next_year = future_tdi - MAX_TRADING_DAYS
+                    
+                    # Rendimento a fine anno corrente
+                    last_val_year = storico[anno].dropna().iloc[-1] if len(storico[anno].dropna()) > 0 else np.nan
+                    
+                    # Rendimento al TDI target nell'anno successivo
+                    if tdi_next_year in storico.index:
+                        val_next_year = storico.loc[tdi_next_year, anno_next]
+                        
+                        if not pd.isna(last_val_year) and not pd.isna(val_next_year):
+                            # Forward return cross-year:
+                            # (rendimento fino a fine anno) + (rendimento nell'anno nuovo)
+                            # Nota: val_next_year è già YTD del nuovo anno, quindi va combinato
+                            # correttamente col rendimento residuo dell'anno vecchio
+                            
+                            # Approssimazione: usiamo la somma dei rendimenti
+                            # (più preciso sarebbe (1+r1)*(1+r2)-1 ma per % piccole è simile)
+                            fwd_ret = (last_val_year - val_tdi) + val_next_year
+                            forward_rets.append(fwd_ret)
+                            matching_years.append(f"{anno}-{anno_next}")
     
     if len(forward_rets) == 0:
         return {}
@@ -567,27 +733,23 @@ def scan_universe_for_anomalies(tickers: list, start_date: str,
         progress_bar.progress((i + 1) / len(tickers))
         
         df = fetch_ohlcv(ticker, start_date)
-        if df.empty or len(df) < 252:  # Almeno 1 anno di dati
+        if df.empty or len(df) < 252:
             continue
         
-        pivot = compute_ytd_by_doy(df)
+        pivot_ytd, pivot_returns, metadata = compute_ytd_by_trading_day(df)
         
-        if current_year not in pivot.columns:
+        if current_year not in pivot_ytd.columns:
             continue
         
-        pct = compute_current_percentile(pivot, current_year)
-        if pd.isna(pct):
+        pct, ultimo_tdi = compute_current_percentile(pivot_ytd, current_year, metadata)
+        if pd.isna(pct) or ultimo_tdi == 0:
             continue
         
-        serie_corrente = pivot[current_year].dropna()
-        if len(serie_corrente) == 0:
-            continue
-        
-        ytd_val = serie_corrente.iloc[-1]
+        ytd_val = pivot_ytd[current_year].loc[ultimo_tdi]
         
         # Calcola Z-score
-        zscore_series = compute_zscore_by_doy(pivot, current_year)
-        zscore_current = zscore_series.dropna().iloc[-1] if len(zscore_series.dropna()) > 0 else np.nan
+        zscore_series = compute_zscore_by_tdi(pivot_ytd, current_year, metadata)
+        zscore_current = zscore_series.loc[ultimo_tdi] if ultimo_tdi in zscore_series.index else np.nan
         
         # Classificazione anomalia
         if pct <= threshold_pct:
@@ -602,6 +764,7 @@ def scan_universe_for_anomalies(tickers: list, start_date: str,
             "YTD %": round(ytd_val, 2),
             "Percentile": round(pct, 1),
             "Z-Score": round(zscore_current, 2) if not pd.isna(zscore_current) else None,
+            "TDI": ultimo_tdi,
             "Anomaly": anomaly_type,
         })
     
@@ -620,16 +783,25 @@ def scan_universe_for_anomalies(tickers: list, start_date: str,
 # =============================================================================
 # 12. UTILITY FUNCTIONS
 # =============================================================================
-def doy_to_label(doy_series: pd.Index, ref_year: int = 2024) -> list:
-    """Converte DOY in etichette MM/DD."""
-    labels = []
-    for doy in doy_series:
-        try:
-            d = datetime(ref_year, 1, 1) + pd.Timedelta(days=int(doy) - 1)
-            labels.append(d.strftime("%b %d"))
-        except Exception:
-            labels.append(str(doy))
-    return labels
+def tdi_to_approx_date_label(tdi: int, ref_year: int = 2024) -> str:
+    """
+    Converte TDI in etichetta approssimativa di data.
+    Assume ~21 trading days per mese.
+    """
+    # Approssimazione: TDI 1 = inizio gennaio, TDI 21 = fine gennaio, etc.
+    approx_month = min(12, max(1, (tdi - 1) // 21 + 1))
+    approx_day = min(28, ((tdi - 1) % 21) + 1)
+    
+    try:
+        d = datetime(ref_year, approx_month, approx_day)
+        return d.strftime("%b %d")
+    except:
+        return f"TDI {tdi}"
+
+
+def tdi_to_labels(tdi_series: pd.Index) -> list:
+    """Converte serie di TDI in etichette leggibili."""
+    return [tdi_to_approx_date_label(int(tdi)) for tdi in tdi_series]
 
 
 def get_anomaly_interpretation(pct: float, zscore: float = None) -> tuple:
@@ -678,16 +850,25 @@ def get_anomaly_interpretation(pct: float, zscore: float = None) -> tuple:
 # =============================================================================
 def build_main_percentile_chart(pivot: pd.DataFrame, perc: pd.DataFrame, 
                                  current_year: int, ticker: str,
+                                 metadata: dict,
                                  bootstrap_ci: dict = None) -> go.Figure:
     """Grafico principale con bande percentile e CI bootstrap."""
     fig = go.Figure()
-    labels = doy_to_label(perc.index)
+    
+    # Usa solo TDI con dati validi
+    valid_tdi = perc.dropna().index
+    labels = tdi_to_labels(valid_tdi)
+    
+    perc_valid = perc.loc[valid_tdi]
 
     # Bootstrap CI per banda 95 (se disponibile)
     if bootstrap_ci:
+        ci_valid = bootstrap_ci["p95_ci_upper"].loc[valid_tdi]
+        ci_lower_valid = bootstrap_ci["p95_ci_lower"].loc[valid_tdi]
+        
         fig.add_trace(go.Scatter(
             x=labels + labels[::-1],
-            y=bootstrap_ci["p95_ci_upper"].tolist() + bootstrap_ci["p95_ci_lower"].tolist()[::-1],
+            y=ci_valid.tolist() + ci_lower_valid.tolist()[::-1],
             fill="toself",
             fillcolor=COLORS["ci_band"],
             line=dict(color="rgba(0,0,0,0)"),
@@ -699,7 +880,7 @@ def build_main_percentile_chart(pivot: pd.DataFrame, perc: pd.DataFrame,
     # Banda 5°-95°
     fig.add_trace(go.Scatter(
         x=labels + labels[::-1],
-        y=perc["p95"].tolist() + perc["p5"].tolist()[::-1],
+        y=perc_valid["p95"].tolist() + perc_valid["p5"].tolist()[::-1],
         fill="toself",
         fillcolor=COLORS["band_95"],
         line=dict(color="rgba(0,0,0,0)"),
@@ -711,7 +892,7 @@ def build_main_percentile_chart(pivot: pd.DataFrame, perc: pd.DataFrame,
     # Banda IQR
     fig.add_trace(go.Scatter(
         x=labels + labels[::-1],
-        y=perc["p75"].tolist() + perc["p25"].tolist()[::-1],
+        y=perc_valid["p75"].tolist() + perc_valid["p25"].tolist()[::-1],
         fill="toself",
         fillcolor=COLORS["band_iqr"],
         line=dict(color="rgba(0,0,0,0)"),
@@ -723,52 +904,57 @@ def build_main_percentile_chart(pivot: pd.DataFrame, perc: pd.DataFrame,
     # Mediana
     fig.add_trace(go.Scatter(
         x=labels,
-        y=perc["p50"].tolist(),
+        y=perc_valid["p50"].tolist(),
         mode="lines",
         line=dict(color=COLORS["median"], width=1.5, dash="dash"),
         name="Mediana (50° Pct)",
         showlegend=True,
     ))
 
-    # Equity YTD corrente
+    # Equity YTD corrente (SOLO fino all'ultimo TDI reale)
     serie_corrente = pivot.get(current_year)
     if serie_corrente is not None:
-        ultimo_doy_valido = serie_corrente.last_valid_index()
-        serie_plot = serie_corrente.loc[:ultimo_doy_valido]
-        labels_ytd = doy_to_label(serie_plot.index)
+        ultimo_tdi = metadata["last_valid_tdi"].get(current_year, 0)
+        
+        # Filtra solo TDI validi e fino all'ultimo reale
+        serie_plot = serie_corrente.loc[:ultimo_tdi].dropna()
+        serie_plot = serie_plot[serie_plot.index.isin(valid_tdi)]
+        
+        if len(serie_plot) > 0:
+            labels_ytd = tdi_to_labels(serie_plot.index)
 
-        fig.add_trace(go.Scatter(
-            x=labels_ytd,
-            y=serie_plot.values,
-            mode="lines",
-            line=dict(color=COLORS["ytd"], width=3),
-            name=f"YTD {current_year}",
-            showlegend=True,
-        ))
+            fig.add_trace(go.Scatter(
+                x=labels_ytd,
+                y=serie_plot.values,
+                mode="lines",
+                line=dict(color=COLORS["ytd"], width=3),
+                name=f"YTD {current_year}",
+                showlegend=True,
+            ))
 
-        # Marker ultimo punto
-        ultimo_val = serie_plot.iloc[-1]
-        ultimo_label = labels_ytd[-1]
-        segno = "+" if ultimo_val >= 0 else ""
+            # Marker ultimo punto
+            ultimo_val = serie_plot.iloc[-1]
+            ultimo_label = labels_ytd[-1]
+            segno = "+" if ultimo_val >= 0 else ""
 
-        fig.add_trace(go.Scatter(
-            x=[ultimo_label],
-            y=[ultimo_val],
-            mode="markers+text",
-            marker=dict(color=COLORS["ytd"], size=10, symbol="circle"),
-            text=[f"{segno}{ultimo_val:.2f}%"],
-            textposition="top right",
-            textfont=dict(color=COLORS["ytd"], size=13, family="Arial Black"),
-            showlegend=False,
-            hoverinfo="skip",
-        ))
+            fig.add_trace(go.Scatter(
+                x=[ultimo_label],
+                y=[ultimo_val],
+                mode="markers+text",
+                marker=dict(color=COLORS["ytd"], size=10, symbol="circle"),
+                text=[f"{segno}{ultimo_val:.2f}%"],
+                textposition="top right",
+                textfont=dict(color=COLORS["ytd"], size=13, family="Arial Black"),
+                showlegend=False,
+                hoverinfo="skip",
+            ))
 
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor=COLORS["background"],
         plot_bgcolor=COLORS["background"],
         xaxis=dict(
-            title="Giorno dell'Anno",
+            title="Trading Day (approssimazione calendario)",
             showgrid=True,
             gridcolor=COLORS["grid"],
             tickangle=-45,
@@ -796,7 +982,7 @@ def build_main_percentile_chart(pivot: pd.DataFrame, perc: pd.DataFrame,
 
 
 def build_zscore_chart(zscore_series: pd.Series, vol_context: pd.DataFrame, 
-                       current_year: int) -> go.Figure:
+                       current_year: int, metadata: dict) -> go.Figure:
     """Grafico Z-Score con contesto volatilità."""
     fig = make_subplots(
         rows=2, cols=1,
@@ -806,8 +992,10 @@ def build_zscore_chart(zscore_series: pd.Series, vol_context: pd.DataFrame,
         row_heights=[0.6, 0.4],
     )
     
-    zscore_clean = zscore_series.dropna()
-    labels = doy_to_label(zscore_clean.index)
+    ultimo_tdi = metadata["last_valid_tdi"].get(current_year, 0)
+    
+    zscore_clean = zscore_series.loc[:ultimo_tdi].dropna()
+    labels = tdi_to_labels(zscore_clean.index)
     
     # Colori condizionali per Z-score
     colors = [COLORS["zscore_pos"] if z >= 0 else COLORS["zscore_neg"] for z in zscore_clean.values]
@@ -826,15 +1014,15 @@ def build_zscore_chart(zscore_series: pd.Series, vol_context: pd.DataFrame,
             y=sigma, 
             line_dash=dash, 
             line_color="rgba(255,255,255,0.3)",
-            annotation_text=f"{sigma}σ" if sigma > 0 else f"{sigma}σ",
+            annotation_text=f"{sigma}σ",
             annotation_position="right",
             row=1, col=1,
         )
     
     # Volatilità contestuale
     if not vol_context.empty:
-        vol_clean = vol_context.dropna()
-        labels_vol = doy_to_label(vol_clean.index)
+        vol_clean = vol_context.loc[:ultimo_tdi].dropna()
+        labels_vol = tdi_to_labels(vol_clean.index)
         
         fig.add_trace(go.Scatter(
             x=labels_vol,
@@ -862,13 +1050,13 @@ def build_zscore_chart(zscore_series: pd.Series, vol_context: pd.DataFrame,
     )
     
     fig.update_yaxes(title_text="Z-Score (σ)", row=1, col=1, gridcolor=COLORS["grid"])
-    fig.update_yaxes(title_text="Volatilità", row=2, col=1, gridcolor=COLORS["grid"])
+    fig.update_yaxes(title_text="Volatilità (%)", row=2, col=1, gridcolor=COLORS["grid"])
     
     return fig
 
 
 def build_dynamics_chart(dynamics_df: pd.DataFrame, persistence_data: dict, 
-                         current_year: int) -> go.Figure:
+                         current_year: int, metadata: dict) -> go.Figure:
     """Grafico dinamiche anomalia: percentile, velocity, acceleration."""
     fig = make_subplots(
         rows=3, cols=1,
@@ -882,8 +1070,9 @@ def build_dynamics_chart(dynamics_df: pd.DataFrame, persistence_data: dict,
         row_heights=[0.4, 0.3, 0.3],
     )
     
-    dynamics_clean = dynamics_df.dropna()
-    labels = doy_to_label(dynamics_clean.index)
+    ultimo_tdi = metadata["last_valid_tdi"].get(current_year, 0)
+    dynamics_clean = dynamics_df.loc[:ultimo_tdi].dropna()
+    labels = tdi_to_labels(dynamics_clean.index)
     
     # Percentile con zone colorate
     fig.add_trace(go.Scatter(
@@ -902,22 +1091,26 @@ def build_dynamics_chart(dynamics_df: pd.DataFrame, persistence_data: dict,
     fig.add_hline(y=50, line_dash="dash", line_color="white", opacity=0.3, row=1, col=1)
     
     # Velocity
+    vel_clean = dynamics_clean["velocity"].dropna()
+    labels_vel = tdi_to_labels(vel_clean.index)
     vel_colors = [COLORS["zscore_pos"] if v >= 0 else COLORS["zscore_neg"] 
-                  for v in dynamics_clean["velocity"].values]
+                  for v in vel_clean.values]
     fig.add_trace(go.Bar(
-        x=labels,
-        y=dynamics_clean["velocity"],
+        x=labels_vel,
+        y=vel_clean.values,
         marker_color=vel_colors,
         name="Velocity",
         showlegend=False,
     ), row=2, col=1)
     
     # Acceleration
+    acc_clean = dynamics_clean["acceleration"].dropna()
+    labels_acc = tdi_to_labels(acc_clean.index)
     acc_colors = [COLORS["velocity"] if a >= 0 else COLORS["acceleration"] 
-                  for a in dynamics_clean["acceleration"].values]
+                  for a in acc_clean.values]
     fig.add_trace(go.Bar(
-        x=labels,
-        y=dynamics_clean["acceleration"],
+        x=labels_acc,
+        y=acc_clean.values,
         marker_color=acc_colors,
         name="Acceleration",
         showlegend=False,
@@ -939,7 +1132,8 @@ def build_dynamics_chart(dynamics_df: pd.DataFrame, persistence_data: dict,
 
 
 def build_regime_chart(pivot: pd.DataFrame, cluster_df: pd.DataFrame, 
-                       current_year: int, current_regime: str) -> go.Figure:
+                       current_year: int, current_regime: str,
+                       metadata: dict) -> go.Figure:
     """Visualizzazione cluster anni e traiettorie per regime."""
     if cluster_df.empty:
         fig = go.Figure()
@@ -973,7 +1167,6 @@ def build_regime_chart(pivot: pd.DataFrame, cluster_df: pd.DataFrame,
     
     # Traiettorie YTD per regime
     storico = pivot.drop(columns=[current_year], errors="ignore")
-    labels = doy_to_label(pivot.index)
     
     for regime in ["Bull", "Bear", "Sideways"]:
         regime_years = cluster_df[cluster_df["regime"] == regime].index.tolist()
@@ -982,7 +1175,7 @@ def build_regime_chart(pivot: pd.DataFrame, cluster_df: pd.DataFrame,
         if len(regime_years) > 0:
             for i, anno in enumerate(regime_years):
                 serie = storico[anno].dropna()
-                labels_anno = doy_to_label(serie.index)
+                labels_anno = tdi_to_labels(serie.index)
                 fig.add_trace(go.Scatter(
                     x=labels_anno,
                     y=serie.values,
@@ -997,8 +1190,9 @@ def build_regime_chart(pivot: pd.DataFrame, cluster_df: pd.DataFrame,
     # Anno corrente
     serie_corrente = pivot.get(current_year)
     if serie_corrente is not None:
-        serie_corrente = serie_corrente.dropna()
-        labels_curr = doy_to_label(serie_corrente.index)
+        ultimo_tdi = metadata["last_valid_tdi"].get(current_year, 0)
+        serie_corrente = serie_corrente.loc[:ultimo_tdi].dropna()
+        labels_curr = tdi_to_labels(serie_corrente.index)
         fig.add_trace(go.Scatter(
             x=labels_curr,
             y=serie_corrente.values,
@@ -1015,8 +1209,8 @@ def build_regime_chart(pivot: pd.DataFrame, cluster_df: pd.DataFrame,
     )
     
     fig.update_xaxes(title_text="Rendimento Finale (%)", row=1, col=1, gridcolor=COLORS["grid"])
-    fig.update_yaxes(title_text="Volatilità Path", row=1, col=1, gridcolor=COLORS["grid"])
-    fig.update_xaxes(title_text="Giorno dell'Anno", row=1, col=2, gridcolor=COLORS["grid"])
+    fig.update_yaxes(title_text="Volatilità Path (%)", row=1, col=1, gridcolor=COLORS["grid"])
+    fig.update_xaxes(title_text="Trading Day", row=1, col=2, gridcolor=COLORS["grid"])
     fig.update_yaxes(title_text="YTD %", row=1, col=2, gridcolor=COLORS["grid"])
     
     return fig
@@ -1094,11 +1288,11 @@ def main():
         st.subheader("🎛️ Parametri Avanzati")
         
         lookahead_days = st.slider(
-            "Forward Lookahead (giorni)",
+            "Forward Lookahead (trading days)",
             min_value=5,
             max_value=60,
             value=20,
-            help="Periodo per analisi mean reversion",
+            help="Periodo per analisi mean reversion (in trading days)",
         )
         
         pct_tolerance = st.slider(
@@ -1118,6 +1312,15 @@ def main():
         st.markdown("---")
         st.caption("📡 Dati: [EODHD API](https://eodhd.com)")
         st.caption("🔬 Kriterion Quant © 2025")
+        
+        st.markdown("---")
+        st.markdown("##### ℹ️ Note Tecniche")
+        st.caption("""
+        - **TDI**: Trading Day Index (evita bias da anni bisestili)
+        - **Max DD**: Calcolato geometricamente
+        - **Volatilità**: Su rendimenti giornalieri (non YTD cumulato)
+        - **Forward**: Gestisce cross-year
+        """)
 
     # ---- Header ----
     current_year = date.today().year
@@ -1144,36 +1347,36 @@ def main():
 
     # ---- Core Computations ----
     with st.spinner("Elaborazione dati..."):
-        pivot = compute_ytd_by_doy(df)
-        anni_disponibili = sorted(pivot.columns.tolist())
+        pivot_ytd, pivot_returns, metadata = compute_ytd_by_trading_day(df)
+        anni_disponibili = sorted(pivot_ytd.columns.tolist())
         
         if len(anni_disponibili) < 3:
             st.error("❌ Storico insufficiente: servono almeno 3 anni di dati.")
             st.stop()
         
-        perc = compute_percentiles(pivot, current_year)
-        pct_attuale = compute_current_percentile(pivot, current_year)
-        zscore_series = compute_zscore_by_doy(pivot, current_year)
-        vol_context = compute_rolling_volatility_context(pivot, current_year)
-        dynamics = compute_percentile_dynamics(pivot, current_year)
-        persistence = compute_anomaly_persistence(pivot, perc, current_year)
-        cluster_df = cluster_historical_years(pivot, current_year)
-        current_regime = identify_current_regime(pivot, current_year, cluster_df)
-        regime_perc = compute_regime_conditional_percentiles(pivot, current_year, cluster_df, current_regime)
+        perc = compute_percentiles(pivot_ytd, current_year)
+        pct_attuale, ultimo_tdi = compute_current_percentile(pivot_ytd, current_year, metadata)
+        zscore_series = compute_zscore_by_tdi(pivot_ytd, current_year, metadata)
+        vol_context = compute_rolling_volatility_context(pivot_returns, current_year, metadata)
+        dynamics = compute_percentile_dynamics(pivot_ytd, current_year, metadata)
+        persistence = compute_anomaly_persistence(pivot_ytd, perc, current_year, metadata)
+        cluster_df = cluster_historical_years(pivot_ytd, pivot_returns, current_year)
+        current_regime = identify_current_regime(pivot_ytd, pivot_returns, current_year, cluster_df, metadata)
+        regime_perc = compute_regime_conditional_percentiles(pivot_ytd, current_year, cluster_df, current_regime)
         forward_data = compute_forward_return_distribution(
-            pivot, current_year, lookahead_days=lookahead_days, pct_tolerance=pct_tolerance
+            pivot_ytd, current_year, metadata,
+            lookahead_days=lookahead_days, pct_tolerance=pct_tolerance
         )
-        bootstrap_ci = bootstrap_percentile_bands(pivot, current_year, n_bootstrap=n_bootstrap)
+        bootstrap_ci = bootstrap_percentile_bands(pivot_ytd, current_year, n_bootstrap=n_bootstrap)
     
     # ---- Quick Stats Header ----
-    serie_corrente = pivot.get(current_year)
-    ytd_val = serie_corrente.dropna().iloc[-1] if serie_corrente is not None else np.nan
-    zscore_current = zscore_series.dropna().iloc[-1] if len(zscore_series.dropna()) > 0 else np.nan
+    ytd_val = pivot_ytd[current_year].loc[ultimo_tdi] if ultimo_tdi > 0 else np.nan
+    zscore_current = zscore_series.loc[ultimo_tdi] if ultimo_tdi in zscore_series.index else np.nan
     
     interpretation, color, emoji = get_anomaly_interpretation(pct_attuale, zscore_current)
     
     st.markdown("---")
-    cols = st.columns(5)
+    cols = st.columns(6)
     
     with cols[0]:
         segno = "+" if (not pd.isna(ytd_val) and ytd_val >= 0) else ""
@@ -1189,7 +1392,10 @@ def main():
         st.metric("Regime", current_regime)
     
     with cols[4]:
-        st.metric("Streak Fuori IQR", f"{persistence['current_streak']} giorni")
+        st.metric("Streak Fuori IQR", f"{persistence['current_streak']} gg")
+    
+    with cols[5]:
+        st.metric("Trading Day", f"{ultimo_tdi}/{MAX_TRADING_DAYS}")
     
     st.info(f"{emoji} **{interpretation}**")
     
@@ -1210,17 +1416,19 @@ def main():
         st.markdown("""
         <div style="background-color: rgba(100,149,237,0.1); padding: 15px; border-radius: 10px; margin-bottom: 20px;">
         <b>📖 Come leggere questo grafico:</b><br>
-        Le <b>bande colorate</b> rappresentano la distribuzione storica dei rendimenti YTD per ogni giorno dell'anno.
+        Le <b>bande colorate</b> rappresentano la distribuzione storica dei rendimenti YTD per ogni trading day.
         La <b>linea rossa</b> è la performance dell'anno corrente. Quando esce dalle bande, indica un'<b>anomalia statistica</b>.
         <ul>
         <li><b>Banda chiara (5°-95°)</b>: range "normale" - il 90% degli anni storici cade qui</li>
         <li><b>Banda scura (25°-75°)</b>: range IQR - la "zona di comfort" del 50% centrale</li>
         <li><b>Linea tratteggiata</b>: mediana storica (50° percentile)</li>
         </ul>
+        <b>Nota tecnica:</b> L'asse X usa il <b>Trading Day Index</b> (TDI) invece del Day-of-Year per eliminare 
+        disallineamenti da anni bisestili e festività variabili.
         </div>
         """, unsafe_allow_html=True)
         
-        fig_main = build_main_percentile_chart(pivot, perc, current_year, ticker, bootstrap_ci)
+        fig_main = build_main_percentile_chart(pivot_ytd, perc, current_year, ticker, metadata, bootstrap_ci)
         st.plotly_chart(fig_main, use_container_width=True)
         
         # Insight contestuali
@@ -1230,13 +1438,20 @@ def main():
             st.markdown("#### 📊 Statistiche Distribuzione")
             anni_storico = [a for a in anni_disponibili if a != current_year]
             
+            # Valori al TDI corrente
+            p50_oggi = perc['p50'].loc[ultimo_tdi] if ultimo_tdi in perc.index else np.nan
+            p25_oggi = perc['p25'].loc[ultimo_tdi] if ultimo_tdi in perc.index else np.nan
+            p75_oggi = perc['p75'].loc[ultimo_tdi] if ultimo_tdi in perc.index else np.nan
+            p5_oggi = perc['p5'].loc[ultimo_tdi] if ultimo_tdi in perc.index else np.nan
+            p95_oggi = perc['p95'].loc[ultimo_tdi] if ultimo_tdi in perc.index else np.nan
+            
             stats_data = {
-                "Metrica": ["Anni in analisi", "Mediana storica (oggi)", "IQR Range", "5°-95° Range"],
+                "Metrica": ["Anni in analisi", "Mediana storica (TDI corrente)", "IQR Range", "5°-95° Range"],
                 "Valore": [
                     f"{len(anni_storico)} ({min(anni_storico)}-{max(anni_storico)})",
-                    f"{perc['p50'].dropna().iloc[-1]:.2f}%" if len(perc['p50'].dropna()) > 0 else "N/D",
-                    f"{perc['p25'].dropna().iloc[-1]:.2f}% → {perc['p75'].dropna().iloc[-1]:.2f}%" if len(perc['p25'].dropna()) > 0 else "N/D",
-                    f"{perc['p5'].dropna().iloc[-1]:.2f}% → {perc['p95'].dropna().iloc[-1]:.2f}%" if len(perc['p5'].dropna()) > 0 else "N/D",
+                    f"{p50_oggi:.2f}%" if not pd.isna(p50_oggi) else "N/D",
+                    f"{p25_oggi:.2f}% → {p75_oggi:.2f}%" if not pd.isna(p25_oggi) else "N/D",
+                    f"{p5_oggi:.2f}% → {p95_oggi:.2f}%" if not pd.isna(p5_oggi) else "N/D",
                 ],
             }
             st.dataframe(pd.DataFrame(stats_data), use_container_width=True, hide_index=True)
@@ -1300,11 +1515,12 @@ def main():
         <li><b>|Z| > 2.5</b>: anomalia molto significativa (p < 0.01)</li>
         <li><b>|Z| > 3</b>: evento raro, circa 0.3% delle osservazioni</li>
         </ul>
-        Il pannello inferiore mostra se la <b>volatilità corrente</b> è alta/bassa rispetto alla media storica per questo periodo.
+        <b>Nota tecnica:</b> La volatilità nel pannello inferiore è calcolata sui <b>rendimenti giornalieri veri</b> 
+        (non sulla variazione del YTD cumulato), evitando distorsioni da scaling.
         </div>
         """, unsafe_allow_html=True)
         
-        fig_zscore = build_zscore_chart(zscore_series, vol_context, current_year)
+        fig_zscore = build_zscore_chart(zscore_series, vol_context, current_year, metadata)
         st.plotly_chart(fig_zscore, use_container_width=True)
         
         col1, col2 = st.columns(2)
@@ -1331,8 +1547,8 @@ def main():
         with col2:
             st.markdown("#### 🌊 Contesto Volatilità")
             
-            if not vol_context.empty:
-                vol_zscore_current = vol_context["vol_zscore"].dropna().iloc[-1] if len(vol_context["vol_zscore"].dropna()) > 0 else np.nan
+            if not vol_context.empty and ultimo_tdi in vol_context.index:
+                vol_zscore_current = vol_context.loc[ultimo_tdi, "vol_zscore"]
                 
                 if not pd.isna(vol_zscore_current):
                     st.metric("Vol Z-Score", f"{vol_zscore_current:.2f}σ")
@@ -1363,32 +1579,32 @@ def main():
         <b>📖 Velocity & Acceleration:</b><br>
         Non basta sapere <i>dove</i> sei, conta anche <i>come</i> ci sei arrivato e <i>verso dove</i> stai andando.
         <ul>
-        <li><b>Velocity</b>: quanto velocemente sta cambiando il tuo ranking percentile</li>
-        <li><b>Acceleration</b>: la velocità sta aumentando o diminuendo?</li>
-        <li><b>Persistenza</b>: da quanti giorni sei fuori dalla zona normale?</li>
+        <li><b>Velocity</b>: quanto velocemente sta cambiando il tuo ranking percentile (Δ su 5 trading days)</li>
+        <li><b>Acceleration</b>: la velocità sta aumentando o diminuendo? (ΔΔ)</li>
+        <li><b>Persistenza</b>: da quanti trading days sei fuori dalla zona normale?</li>
         </ul>
         Un'anomalia con <b>velocity negativa in accelerazione</b> mentre sei già sotto il 25° percentile è un segnale di stress significativo.
         </div>
         """, unsafe_allow_html=True)
         
         if not dynamics.empty:
-            fig_dynamics = build_dynamics_chart(dynamics, persistence, current_year)
+            fig_dynamics = build_dynamics_chart(dynamics, persistence, current_year, metadata)
             st.plotly_chart(fig_dynamics, use_container_width=True)
         
         col1, col2, col3 = st.columns(3)
         
         with col1:
             st.markdown("#### 🏃 Velocity")
-            velocity_current = dynamics["velocity"].dropna().iloc[-1] if len(dynamics["velocity"].dropna()) > 0 else np.nan
+            velocity_current = dynamics["velocity"].loc[ultimo_tdi] if ultimo_tdi in dynamics.index else np.nan
             
             if not pd.isna(velocity_current):
                 direction = "📈 Miglioramento" if velocity_current > 0 else "📉 Peggioramento"
-                st.metric("Δ Percentile (5gg)", f"{velocity_current:+.1f}")
+                st.metric("Δ Percentile (5 TDI)", f"{velocity_current:+.1f}")
                 st.markdown(f"**Trend:** {direction}")
         
         with col2:
             st.markdown("#### 🚀 Acceleration")
-            acc_current = dynamics["acceleration"].dropna().iloc[-1] if len(dynamics["acceleration"].dropna()) > 0 else np.nan
+            acc_current = dynamics["acceleration"].loc[ultimo_tdi] if ultimo_tdi in dynamics.index else np.nan
             
             if not pd.isna(acc_current):
                 if acc_current > 2:
@@ -1401,9 +1617,9 @@ def main():
         
         with col3:
             st.markdown("#### ⏱️ Persistenza")
-            st.metric("Streak Corrente", f"{persistence['current_streak']} giorni")
-            st.metric("Max Streak (anno)", f"{persistence['max_streak']} giorni")
-            st.metric("% Giorni Fuori IQR", f"{persistence['pct_days_outside']:.1f}%")
+            st.metric("Streak Corrente", f"{persistence['current_streak']} TDI")
+            st.metric("Max Streak (anno)", f"{persistence['max_streak']} TDI")
+            st.metric("% TDI Fuori IQR", f"{persistence['pct_days_outside']:.1f}%")
             
             if persistence['current_streak'] > 10:
                 st.warning("⚠️ Anomalia persistente - potenziale cambio regime")
@@ -1411,6 +1627,9 @@ def main():
         # Insight combinato
         st.markdown("---")
         st.markdown("#### 🧠 Diagnosi Combinata")
+        
+        velocity_current = dynamics["velocity"].loc[ultimo_tdi] if ultimo_tdi in dynamics.index else np.nan
+        acc_current = dynamics["acceleration"].loc[ultimo_tdi] if ultimo_tdi in dynamics.index else np.nan
         
         if not pd.isna(velocity_current) and not pd.isna(acc_current):
             if pct_attuale < 25 and velocity_current < -2 and acc_current < 0:
@@ -1451,12 +1670,16 @@ def main():
         <li>🔴 <b>Bear</b>: anni con rendimenti finali negativi</li>
         <li>🟡 <b>Sideways</b>: anni con rendimenti moderati/laterali</li>
         </ul>
-        I <b>percentili regime-conditional</b> confrontano l'anno corrente solo con anni dello stesso tipo.
+        <b>Note tecniche:</b>
+        <ul>
+        <li>La <b>volatilità</b> è calcolata sui rendimenti giornalieri (non sul YTD cumulato)</li>
+        <li>Il <b>Max Drawdown</b> è calcolato geometricamente: (peak - current) / peak</li>
+        </ul>
         </div>
         """, unsafe_allow_html=True)
         
         if not cluster_df.empty:
-            fig_regime = build_regime_chart(pivot, cluster_df, current_year, current_regime)
+            fig_regime = build_regime_chart(pivot_ytd, cluster_df, current_year, current_regime, metadata)
             st.plotly_chart(fig_regime, use_container_width=True)
             
             col1, col2 = st.columns(2)
@@ -1484,22 +1707,21 @@ def main():
                     st.caption(f"Anni simili: {', '.join(map(str, same_regime_years))}")
             
             # Percentili regime-conditional
-            if not regime_perc.empty:
+            if not regime_perc.empty and current_regime not in ["Unknown", "Insufficient Data"]:
                 st.markdown("---")
                 st.markdown("#### 📊 Percentili Regime-Conditional")
                 
                 # Calcola percentile condizionale
-                serie_corrente = pivot.get(current_year)
-                if serie_corrente is not None:
-                    ultimo_doy = serie_corrente.dropna().index[-1]
-                    val_corrente = serie_corrente.loc[ultimo_doy]
+                serie_corrente = pivot_ytd.get(current_year)
+                if serie_corrente is not None and ultimo_tdi > 0:
+                    val_corrente = serie_corrente.loc[ultimo_tdi]
                     
                     same_regime_years = cluster_df[cluster_df["regime"] == current_regime].index.tolist()
-                    same_regime_years = [y for y in same_regime_years if y != current_year and y in pivot.columns]
+                    same_regime_years = [y for y in same_regime_years if y != current_year and y in pivot_ytd.columns]
                     
                     if len(same_regime_years) >= 3:
-                        storico_regime = pivot[same_regime_years]
-                        vals_regime = storico_regime.loc[ultimo_doy].dropna()
+                        storico_regime = pivot_ytd[same_regime_years]
+                        vals_regime = storico_regime.loc[ultimo_tdi].dropna()
                         pct_conditional = (vals_regime < val_corrente).sum() / len(vals_regime) * 100
                         
                         col1, col2 = st.columns(2)
@@ -1529,8 +1751,13 @@ def main():
         <div style="background-color: rgba(100,149,237,0.1); padding: 15px; border-radius: 10px; margin-bottom: 20px;">
         <b>📖 Probabilità Condizionale:</b><br>
         Storicamente, quando l'asset era in una posizione percentile simile (±{pct_tolerance}%) 
-        nello stesso periodo dell'anno, cosa è successo nei {lookahead_days} giorni successivi?
+        nello stesso periodo dell'anno, cosa è successo nei <b>{lookahead_days} trading days</b> successivi?
         <br><br>
+        <b>Note tecniche:</b>
+        <ul>
+        <li>L'analisi <b>gestisce il cross-year</b>: se il lookahead supera fine anno, combina i rendimenti tra anni</li>
+        <li>Il lookahead è espresso in <b>trading days</b>, non giorni calendario</li>
+        </ul>
         ⚠️ <b>Attenzione:</b> Questa è un'analisi empirica, non una previsione. 
         I campioni potrebbero essere limitati e le condizioni di mercato diverse.
         </div>
@@ -1571,7 +1798,7 @@ def main():
                     📈 **Bias storico POSITIVO**
                     
                     In {forward_data['n_samples']} casi simili, il {forward_data['prob_positive']:.1f}% 
-                    delle volte il rendimento forward a {lookahead_days} giorni è stato positivo.
+                    delle volte il rendimento forward a {lookahead_days} trading days è stato positivo.
                     
                     Media: {forward_data['mean_forward']:+.2f}% | Mediana: {forward_data['median_forward']:+.2f}%
                     """)
@@ -1594,7 +1821,7 @@ def main():
             
             # Anni matching
             with st.expander("📅 Anni con pattern simile"):
-                st.write(f"Anni trovati con percentile ±{pct_tolerance}% al DOY corrente:")
+                st.write(f"Anni trovati con percentile ±{pct_tolerance}% al TDI corrente:")
                 st.write(", ".join(map(str, forward_data["matching_years"])))
         else:
             st.warning("⚠️ Nessun dato storico comparabile trovato. Prova ad aumentare la tolleranza percentile.")
