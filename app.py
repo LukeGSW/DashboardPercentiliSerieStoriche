@@ -130,6 +130,10 @@ def compute_ytd_by_trading_day(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     df = df.copy()
     df["year"] = df["date"].dt.year
     
+    # CRITICO: Calcola i rendimenti giornalieri PRIMA del loop annuale
+    # per catturare il gap year-boundary (ultimo giorno anno N -> primo giorno anno N+1)
+    df["daily_return"] = df["adjusted_close"].pct_change() * 100
+    
     anni = sorted(df["year"].unique())
     
     ytd_dict = {}
@@ -155,9 +159,6 @@ def compute_ytd_by_trading_day(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
         # Rendimento YTD cumulato
         df_anno["ytd_pct"] = (df_anno["adjusted_close"] / base_price - 1) * 100
         
-        # Rendimenti giornalieri (per volatilità) - calcolati sui PREZZI, non su YTD
-        df_anno["daily_return"] = df_anno["adjusted_close"].pct_change() * 100
-        
         # Crea serie con TDI come indice
         max_tdi = df_anno["tdi"].max()
         
@@ -169,7 +170,7 @@ def compute_ytd_by_trading_day(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
         serie_ytd.loc[:max_tdi] = serie_ytd.loc[:max_tdi].ffill()
         # I giorni oltre max_tdi rimangono NaN (cruciale per anno corrente)
         
-        # Serie returns giornalieri
+        # Serie returns giornalieri - già calcolati sul df completo, quindi include il gap year-boundary
         serie_returns = pd.Series(index=range(1, MAX_TRADING_DAYS + 1), dtype=float)
         serie_returns.loc[df_anno["tdi"]] = df_anno["daily_return"].values
         
@@ -449,7 +450,14 @@ def cluster_historical_years(pivot_ytd: pd.DataFrame, pivot_returns: pd.DataFram
                               current_year: int, n_clusters: int = 3) -> pd.DataFrame:
     """
     Clustering degli anni storici per regime (bull/bear/sideways).
-    Usa volatilità calcolata sui RENDIMENTI GIORNALIERI e Max DD GEOMETRICO.
+    Usa volatilità calcolata sui RENDIMENTI GIORNALIERI, Max DD GEOMETRICO,
+    e Sharpe Ratio Proxy per una caratterizzazione multi-dimensionale.
+    
+    Feature space (4D):
+        - final_ret: rendimento YTD finale
+        - path_vol: volatilità dei rendimenti giornalieri
+        - max_dd: maximum drawdown geometrico
+        - sharpe_proxy: rendimento risk-adjusted annualizzato
     """
     storico_ytd = pivot_ytd.drop(columns=[current_year], errors="ignore")
     storico_returns = pivot_returns.drop(columns=[current_year], errors="ignore")
@@ -469,19 +477,20 @@ def cluster_historical_years(pivot_ytd: pd.DataFrame, pivot_returns: pd.DataFram
     # Max Drawdown GEOMETRICO corretto
     features["max_dd"] = storico_ytd.apply(compute_geometric_max_drawdown)
     
-    # Sharpe proxy annualizzato
+    # Sharpe proxy annualizzato (ORA UTILIZZATO nel clustering)
     mean_daily_ret = storico_returns.mean()
     std_daily_ret = storico_returns.std()
-    features["sharpe_proxy"] = (mean_daily_ret * 252) / (std_daily_ret * np.sqrt(252))
+    features["sharpe_proxy"] = (mean_daily_ret * 252) / (std_daily_ret.replace(0, np.nan) * np.sqrt(252))
     
     features_clean = features.dropna()
     
     if len(features_clean) < n_clusters:
         return pd.DataFrame()
     
-    # Normalizzazione e clustering
+    # Normalizzazione e clustering (4 feature incluso Sharpe)
     scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features_clean[["final_ret", "path_vol", "max_dd"]])
+    feature_cols = ["final_ret", "path_vol", "max_dd", "sharpe_proxy"]
+    features_scaled = scaler.fit_transform(features_clean[feature_cols])
     
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     features_clean["cluster"] = kmeans.fit_predict(features_scaled)
@@ -503,6 +512,7 @@ def identify_current_regime(pivot_ytd: pd.DataFrame, pivot_returns: pd.DataFrame
                              metadata: dict) -> str:
     """
     Identifica il regime più probabile dell'anno corrente.
+    Usa le stesse 4 feature del clustering (final_ret, path_vol, max_dd, sharpe_proxy).
     """
     if cluster_df.empty:
         return "Unknown"
@@ -522,21 +532,27 @@ def identify_current_regime(pivot_ytd: pd.DataFrame, pivot_returns: pd.DataFrame
     serie_ytd_valid = serie_ytd.loc[:ultimo_tdi].dropna()
     serie_returns_valid = serie_returns.loc[:ultimo_tdi].dropna()
     
-    if len(serie_ytd_valid) < 20:
+    if len(serie_ytd_valid) < 20 or len(serie_returns_valid) < 20:
         return "Insufficient Data"
     
     current_ret = serie_ytd_valid.iloc[-1]
     current_vol = serie_returns_valid.std()
     current_dd = compute_geometric_max_drawdown(serie_ytd_valid)
     
-    # Trova il regime più simile (nearest neighbor)
+    # Sharpe proxy corrente (annualizzato)
+    mean_ret = serie_returns_valid.mean()
+    std_ret = serie_returns_valid.std()
+    current_sharpe = (mean_ret * 252) / (std_ret * np.sqrt(252)) if std_ret > 0 else 0
+    
+    # Trova il regime più simile (nearest neighbor con tutte e 4 le feature)
+    # Normalizza le distanze per deviazione standard del cluster
     distances = []
     for _, row in cluster_df.iterrows():
-        # Normalizza le distanze
         dist = np.sqrt(
             ((current_ret - row["final_ret"]) / cluster_df["final_ret"].std())**2 +
             ((current_vol - row["path_vol"]) / cluster_df["path_vol"].std())**2 +
-            ((current_dd - row["max_dd"]) / cluster_df["max_dd"].std())**2
+            ((current_dd - row["max_dd"]) / cluster_df["max_dd"].std())**2 +
+            ((current_sharpe - row["sharpe_proxy"]) / cluster_df["sharpe_proxy"].std())**2
         )
         distances.append((row["regime"], dist))
     
@@ -575,7 +591,7 @@ def compute_regime_conditional_percentiles(pivot: pd.DataFrame, current_year: in
 
 
 # =============================================================================
-# 9. FORWARD RETURNS (CON CROSS-YEAR HANDLING)
+# 9. FORWARD RETURNS (CON CROSS-YEAR HANDLING E COMPOUNDING GEOMETRICO)
 # =============================================================================
 def compute_forward_return_distribution(pivot: pd.DataFrame, current_year: int, 
                                          metadata: dict,
@@ -583,7 +599,13 @@ def compute_forward_return_distribution(pivot: pd.DataFrame, current_year: int,
                                          pct_tolerance: float = 10) -> dict:
     """
     Distribuzione dei rendimenti forward storici quando in anomalia simile.
-    GESTISCE CORRETTAMENTE il wrap-around tra anni.
+    GESTISCE CORRETTAMENTE il wrap-around tra anni con COMPOUNDING GEOMETRICO.
+    
+    Il rendimento forward cross-year è calcolato come:
+        R_total = (1 + R1) * (1 + R2) - 1
+    dove:
+        R1 = rendimento dal TDI corrente a fine anno (estratto geometricamente)
+        R2 = rendimento YTD nell'anno successivo al TDI target
     """
     storico = pivot.drop(columns=[current_year], errors="ignore")
     serie_corrente = pivot.get(current_year)
@@ -624,35 +646,42 @@ def compute_forward_return_distribution(pivot: pd.DataFrame, current_year: int,
             future_tdi = ultimo_tdi + lookahead_days
             
             if future_tdi <= MAX_TRADING_DAYS:
-                # Forward return nello stesso anno
+                # Forward return nello stesso anno (semplice differenza su YTD)
                 future_val = storico.loc[future_tdi, anno]
                 if not pd.isna(future_val):
-                    fwd_ret = future_val - val_tdi
-                    forward_rets.append(fwd_ret)
+                    # Anche qui usiamo il compounding corretto per estrarre il rendimento relativo
+                    # R = (1 + YTD_future/100) / (1 + YTD_current/100) - 1
+                    r_forward = ((1 + future_val / 100) / (1 + val_tdi / 100) - 1) * 100
+                    forward_rets.append(r_forward)
                     matching_years.append(anno)
             else:
-                # Cross-year: cerca nell'anno successivo
+                # Cross-year: COMPOUNDING GEOMETRICO ESATTO
                 anno_next = anno + 1
                 if anno_next in storico.columns:
                     # TDI nell'anno successivo
                     tdi_next_year = future_tdi - MAX_TRADING_DAYS
                     
-                    # Rendimento a fine anno corrente
-                    last_val_year = storico[anno].dropna().iloc[-1] if len(storico[anno].dropna()) > 0 else np.nan
+                    # Rendimento YTD a fine anno corrente
+                    serie_anno = storico[anno].dropna()
+                    if len(serie_anno) == 0:
+                        continue
+                    last_val_year = serie_anno.iloc[-1]
                     
                     # Rendimento al TDI target nell'anno successivo
                     if tdi_next_year in storico.index:
                         val_next_year = storico.loc[tdi_next_year, anno_next]
                         
                         if not pd.isna(last_val_year) and not pd.isna(val_next_year):
-                            # Forward return cross-year:
-                            # (rendimento fino a fine anno) + (rendimento nell'anno nuovo)
-                            # Nota: val_next_year è già YTD del nuovo anno, quindi va combinato
-                            # correttamente col rendimento residuo dell'anno vecchio
+                            # R1: Rendimento RELATIVO dal TDI corrente a fine anno
+                            # Estratto geometricamente: (1 + YTD_fine) / (1 + YTD_corrente) - 1
+                            r1 = (1 + last_val_year / 100) / (1 + val_tdi / 100) - 1
                             
-                            # Approssimazione: usiamo la somma dei rendimenti
-                            # (più preciso sarebbe (1+r1)*(1+r2)-1 ma per % piccole è simile)
-                            fwd_ret = (last_val_year - val_tdi) + val_next_year
+                            # R2: Rendimento YTD cumulato nel nuovo anno (già relativo a base 0)
+                            r2 = val_next_year / 100
+                            
+                            # Compounding geometrico esatto
+                            fwd_ret = ((1 + r1) * (1 + r2) - 1) * 100
+                            
                             forward_rets.append(fwd_ret)
                             matching_years.append(f"{anno}-{anno_next}")
     
@@ -1670,10 +1699,12 @@ def main():
         <li>🔴 <b>Bear</b>: anni con rendimenti finali negativi</li>
         <li>🟡 <b>Sideways</b>: anni con rendimenti moderati/laterali</li>
         </ul>
-        <b>Note tecniche:</b>
+        <b>Note tecniche (K-Means 4D):</b>
         <ul>
-        <li>La <b>volatilità</b> è calcolata sui rendimenti giornalieri (non sul YTD cumulato)</li>
-        <li>Il <b>Max Drawdown</b> è calcolato geometricamente: (peak - current) / peak</li>
+        <li><b>final_ret</b>: rendimento YTD finale</li>
+        <li><b>path_vol</b>: volatilità sui rendimenti giornalieri</li>
+        <li><b>max_dd</b>: Maximum Drawdown geometrico</li>
+        <li><b>sharpe_proxy</b>: rendimento risk-adjusted annualizzato</li>
         </ul>
         </div>
         """, unsafe_allow_html=True)
@@ -1690,8 +1721,9 @@ def main():
                 regime_summary = cluster_df.groupby("regime").agg({
                     "final_ret": ["count", "mean", "std"],
                     "max_dd": "mean",
+                    "sharpe_proxy": "mean",
                 }).round(2)
-                regime_summary.columns = ["N Anni", "Ret Medio %", "Ret Std", "DD Medio %"]
+                regime_summary.columns = ["N Anni", "Ret Medio %", "Ret Std", "DD Medio %", "Sharpe Medio"]
                 st.dataframe(regime_summary, use_container_width=True)
             
             with col2:
