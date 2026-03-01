@@ -52,8 +52,8 @@ st.set_page_config(
 # =============================================================================
 EODHD_BASE_URL = "https://eodhd.com/api/eod"
 
-# Numero tipico di trading days in un anno (US market)
-MAX_TRADING_DAYS = 253
+# Numero massimo di trading days (verrà sovrascritto dinamicamente se necessario)
+DEFAULT_MAX_TRADING_DAYS = 260  # Sufficiente per la maggior parte dei mercati
 
 # Palette colori Kriterion Quant
 COLORS = {
@@ -138,9 +138,14 @@ def compute_ytd_by_trading_day(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     
     anni = sorted(df["year"].unique())
     
+    # Calcola MAX_TRADING_DAYS dinamicamente basato sui dati
+    # (Forex ha ~260 gg, Crypto ~365, Azioni US ~253)
+    max_tdi_per_year = df.groupby("year").size().max()
+    max_trading_days = max(DEFAULT_MAX_TRADING_DAYS, int(max_tdi_per_year) + 5)  # +5 margine sicurezza
+    
     ytd_dict = {}
     returns_dict = {}
-    metadata = {"last_valid_tdi": {}, "tdi_to_date": {}, "base_prices": {}}
+    metadata = {"last_valid_tdi": {}, "tdi_to_date": {}, "base_prices": {}, "max_trading_days": max_trading_days}
     
     for anno in anni:
         df_anno = df[df["year"] == anno].copy().reset_index(drop=True)
@@ -164,20 +169,20 @@ def compute_ytd_by_trading_day(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
         # Rendimento YTD cumulato
         df_anno["ytd_pct"] = (df_anno["adjusted_close"] / base_price - 1) * 100
         
-        # Crea serie con TDI come indice
+        # Crea serie con TDI come indice (usa max_trading_days dinamico)
         max_tdi = df_anno["tdi"].max()
         
         # Serie YTD - riempita SOLO fino all'ultimo TDI reale, poi NaN
-        serie_ytd = pd.Series(index=range(1, MAX_TRADING_DAYS + 1), dtype=float)
-        serie_ytd.loc[df_anno["tdi"]] = df_anno["ytd_pct"].values
+        serie_ytd = pd.Series(index=range(1, max_trading_days + 1), dtype=float)
+        serie_ytd.loc[df_anno["tdi"].values] = df_anno["ytd_pct"].values
         # Forward fill SOLO fino all'ultimo trading day reale (per weekend/festività infrasettimanali)
         # Ma NON oltre l'ultimo giorno di trading dell'anno
         serie_ytd.loc[:max_tdi] = serie_ytd.loc[:max_tdi].ffill()
         # I giorni oltre max_tdi rimangono NaN (cruciale per anno corrente)
         
         # Serie returns giornalieri - già calcolati sul df completo, quindi include il gap year-boundary
-        serie_returns = pd.Series(index=range(1, MAX_TRADING_DAYS + 1), dtype=float)
-        serie_returns.loc[df_anno["tdi"]] = df_anno["daily_return"].values
+        serie_returns = pd.Series(index=range(1, max_trading_days + 1), dtype=float)
+        serie_returns.loc[df_anno["tdi"].values] = df_anno["daily_return"].values
         
         ytd_dict[anno] = serie_ytd
         returns_dict[anno] = serie_returns
@@ -622,6 +627,9 @@ def compute_forward_return_distribution(pivot: pd.DataFrame, current_year: int,
     if ultimo_tdi == 0:
         return {}
     
+    # Usa max_trading_days dal metadata (dinamico per asset type)
+    max_trading_days = metadata.get("max_trading_days", DEFAULT_MAX_TRADING_DAYS)
+    
     current_val = serie_corrente.loc[ultimo_tdi]
     if pd.isna(current_val):
         return {}
@@ -650,21 +658,24 @@ def compute_forward_return_distribution(pivot: pd.DataFrame, current_year: int,
             # Calcola forward return
             future_tdi = ultimo_tdi + lookahead_days
             
-            if future_tdi <= MAX_TRADING_DAYS:
-                # Forward return nello stesso anno (semplice differenza su YTD)
-                future_val = storico.loc[future_tdi, anno]
-                if not pd.isna(future_val):
-                    # Anche qui usiamo il compounding corretto per estrarre il rendimento relativo
-                    # R = (1 + YTD_future/100) / (1 + YTD_current/100) - 1
-                    r_forward = ((1 + future_val / 100) / (1 + val_tdi / 100) - 1) * 100
-                    forward_rets.append(r_forward)
-                    matching_years.append(anno)
+            # Usa il max TDI effettivo per l'anno specifico per decidere se è cross-year
+            max_tdi_anno = metadata["last_valid_tdi"].get(anno, max_trading_days)
+            
+            if future_tdi <= max_tdi_anno:
+                # Forward return nello stesso anno
+                if future_tdi in storico.index:
+                    future_val = storico.loc[future_tdi, anno]
+                    if not pd.isna(future_val):
+                        # Compounding corretto per estrarre il rendimento relativo
+                        r_forward = ((1 + future_val / 100) / (1 + val_tdi / 100) - 1) * 100
+                        forward_rets.append(r_forward)
+                        matching_years.append(anno)
             else:
                 # Cross-year: COMPOUNDING GEOMETRICO ESATTO
                 anno_next = anno + 1
                 if anno_next in storico.columns:
                     # TDI nell'anno successivo
-                    tdi_next_year = future_tdi - MAX_TRADING_DAYS
+                    tdi_next_year = future_tdi - max_tdi_anno
                     
                     # Rendimento YTD a fine anno corrente
                     serie_anno = storico[anno].dropna()
@@ -678,10 +689,9 @@ def compute_forward_return_distribution(pivot: pd.DataFrame, current_year: int,
                         
                         if not pd.isna(last_val_year) and not pd.isna(val_next_year):
                             # R1: Rendimento RELATIVO dal TDI corrente a fine anno
-                            # Estratto geometricamente: (1 + YTD_fine) / (1 + YTD_corrente) - 1
                             r1 = (1 + last_val_year / 100) / (1 + val_tdi / 100) - 1
                             
-                            # R2: Rendimento YTD cumulato nel nuovo anno (già relativo a base 0)
+                            # R2: Rendimento YTD cumulato nel nuovo anno
                             r2 = val_next_year / 100
                             
                             # Compounding geometrico esatto
@@ -1512,7 +1522,8 @@ def main():
         st.metric("Streak Fuori IQR", f"{persistence['current_streak']} gg")
     
     with cols[5]:
-        st.metric("Trading Day", f"{ultimo_tdi}/{MAX_TRADING_DAYS}")
+        max_tdi_display = metadata.get("max_trading_days", DEFAULT_MAX_TRADING_DAYS)
+        st.metric("Trading Day", f"{ultimo_tdi}/{max_tdi_display}")
     
     st.info(f"{emoji} **{interpretation}**")
     
