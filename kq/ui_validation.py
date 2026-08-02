@@ -307,6 +307,19 @@ def _mostra(out: pd.DataFrame, meta: dict) -> None:
             f"(sposta ogni Extra netto di **{-costo / 100:+.3f} pp**){nota}"
         )
 
+    # Onestà obbligatoria: la direzione operativa degli stati "estesi" è stata
+    # scelta DOPO aver visto questo stesso studio. Un semaforo verde su quelle
+    # righe è in-sample per costruzione e non va letto come conferma.
+    in_sample = [s for s, v in C.SETUP_VERDETTO.items() if v["azione"] != "NESSUNA"]
+    if in_sample:
+        st.warning(
+            f"**Le righe di {', '.join(f'`{s}`' for s in in_sample)} sono in-sample per "
+            f"costruzione.** La loro direzione operativa (`RIBASSISTA`) è stata fissata a "
+            f"partire da questo stesso studio: il segno dell'extra è quindi positivo per "
+            f"come è stata scelta l'ipotesi, non perché sia stata confermata su dati nuovi. "
+            f"Vale come ipotesi da verificare in avanti."
+        )
+
     c = st.columns(5)
     c[0].metric("Celle misurabili", f"{len(mis)}/{len(out)}")
     for i, (etichetta, chiave) in enumerate(
@@ -378,7 +391,8 @@ def _mostra(out: pd.DataFrame, meta: dict) -> None:
 
     L'universo è costruito sui membri di oggi. Le società dislocate che sono risalite
     sono qui; quelle andate a zero sono uscite e non compaiono da nessuna parte. Il bias
-    spinge quindi **a favore della tesi contrarian**: un risultato positivo su `MR-LONG`
+    spinge quindi **a favore della tesi contrarian**: un risultato positivo sugli stati
+    dislocati al ribasso (`↓ STABILIZZATO`, `↓↓ IN CADUTA`)
     va letto come **limite superiore**, non come stima.
 
     La copertura media dei segnalati è **{cop:.1f}%**: nel campione quasi nessun nome
