@@ -138,7 +138,7 @@ def render(api_key: str, ticker: str, start_date: date,
         st.plotly_chart(
             charts.build_main_percentile_chart(pivot_ytd, perc, current_year, ticker,
                                                metadata, bootstrap_ci),
-            use_container_width=True)
+            width="stretch")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -155,7 +155,7 @@ def render(api_key: str, ticker: str, start_date: date,
                     f"{p25:.2f}% → {p75:.2f}%" if not pd.isna(p25) else "N/D",
                     f"{p5:.2f}% → {p95:.2f}%" if not pd.isna(p5) else "N/D",
                 ],
-            }), use_container_width=True, hide_index=True)
+            }), width="stretch", hide_index=True)
 
         with c2:
             st.markdown("#### Interpretazione")
@@ -202,7 +202,7 @@ def render(api_key: str, ticker: str, start_date: date,
         """)
 
         st.plotly_chart(charts.build_zscore_chart(zscore_series, vol_context, current_year, metadata),
-                        use_container_width=True)
+                        width="stretch")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -253,7 +253,7 @@ def render(api_key: str, ticker: str, start_date: date,
         if not dynamics.empty:
             st.plotly_chart(
                 charts.build_dynamics_chart(dynamics, persistence, current_year, metadata),
-                use_container_width=True)
+                width="stretch")
 
         vel = dynamics["velocity"].loc[ultimo_tdi] if ultimo_tdi in dynamics.index else np.nan
         acc = dynamics["acceleration"].loc[ultimo_tdi] if ultimo_tdi in dynamics.index else np.nan
@@ -318,7 +318,7 @@ def render(api_key: str, ticker: str, start_date: date,
         else:
             st.plotly_chart(
                 charts.build_regime_chart(pivot_ytd, cluster_df, current_year, current_regime, metadata),
-                use_container_width=True)
+                width="stretch")
 
             c1, c2 = st.columns(2)
             with c1:
@@ -328,7 +328,7 @@ def render(api_key: str, ticker: str, start_date: date,
                     "max_dd": "mean", "sharpe_proxy": "mean",
                 }).round(2)
                 summary.columns = ["N anni", "Ret medio %", "Ret std", "DD medio %", "Sharpe medio"]
-                st.dataframe(summary, use_container_width=True)
+                st.dataframe(summary, width="stretch")
 
             with c2:
                 st.markdown("#### Regime corrente")
@@ -383,7 +383,7 @@ def render(api_key: str, ticker: str, start_date: date,
         if not forward_data:
             st.warning("Nessun dato storico comparabile. Prova ad aumentare la tolleranza percentile.")
         else:
-            st.plotly_chart(charts.build_forward_returns_chart(forward_data), use_container_width=True)
+            st.plotly_chart(charts.build_forward_returns_chart(forward_data), width="stretch")
 
             c1, c2, c3 = st.columns(3)
             c1.metric("Campioni trovati", forward_data["n_samples"])
