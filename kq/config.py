@@ -59,6 +59,78 @@ HORIZONS = {
 YTD_MIN_TDI = 25
 
 # =============================================================================
+# SETUP: STATO OSSERVATO E VERDETTO DELLA VALIDAZIONE
+# =============================================================================
+# I NOMI descrivono lo STATO in cui si trova lo strumento, non la strategia:
+# lo stato non cambia quando cambia l'evidenza. L'AZIONE, invece, viene dalla
+# validazione walk-forward e vive qui e solo qui — rifatto lo studio, si
+# aggiorna questa tabella e tutto il resto (colonne, strutture in opzioni,
+# segno della tesi nell'event study) segue da solo.
+#
+# Verdetto dell'event study del 2026-08-02 (84 celle: 4 stati x 3 livelli x
+# 7 orizzonti di detenzione, universo large cap USA, dal 2015):
+#
+#   ↑↑ ESTESO       segno negativo su 7 orizzonti su 7, monotono sia sulla
+#                   selettivita' sia sull'orizzonte, OOS piu' forte dell'IS.
+#                   ~ -6%/anno a 20 sedute, t -2.48, q 0.105. Si opera CONTRO
+#                   la direzione del movimento.
+#   ↑ ESAURITO      stessa direzione, sottoperforma a tutti gli orizzonti, ma
+#                   mai significativo (q migliore 0.29). Conferma, non segnale.
+#   ↓ STABILIZZATO  nessun extra a nessun orizzonte. E il survivorship bias
+#                   gioca A FAVORE di questa tesi (mancano i dislocati al
+#                   ribasso finiti a zero): se non emerge nemmeno cosi', non c'e'.
+#   ↓↓ IN CADUTA    segno che si ribalta fra 20 e 40 sedute. Non temporizzabile.
+#
+# ATTENZIONE: la direzione di ↑↑ ESTESO e' stata fissata DOPO aver visto questi
+# dati. Il semaforo su quella riga e' in-sample per costruzione: vale come
+# ipotesi da confermare su dati nuovi, non come risultato out-of-sample.
+SETUP_ESTESO_FORTE = "↑↑ ESTESO"
+SETUP_ESTESO_DEBOLE = "↑ ESAURITO"
+SETUP_SCARICO_FERMO = "↓ STABILIZZATO"
+SETUP_SCARICO_CADUTA = "↓↓ IN CADUTA"
+
+SETUP_VERDETTO: dict[str, dict] = {
+    SETUP_ESTESO_FORTE: {
+        "stato": "Dislocato al rialzo, ancora in accelerazione",
+        "azione": "RIBASSISTA",
+        "evidenza": "confermata",
+        "holding": 20,
+        "nota": "Unico stato con evidenza. Sottoperforma l'universo di ~6%/anno a 20 "
+                "sedute (t −2,48 · q 0,105), con dose-risposta sia sulla selettività "
+                "sia sull'orizzonte e out-of-sample più forte dell'in-sample. "
+                "Si opera CONTRO la direzione del movimento.",
+    },
+    SETUP_ESTESO_DEBOLE: {
+        "stato": "Dislocato al rialzo, momentum esaurito",
+        "azione": "RIBASSISTA",
+        "evidenza": "debole",
+        "holding": 20,
+        "nota": "Sottoperforma a tutti gli orizzonti, stessa direzione dello stato "
+                "precedente, ma mai statisticamente significativo (q migliore 0,29). "
+                "Vale come confluenza, non come segnale autonomo.",
+    },
+    SETUP_SCARICO_FERMO: {
+        "stato": "Dislocato al ribasso, ha smesso di scendere",
+        "azione": "NESSUNA",
+        "evidenza": "assente",
+        "holding": None,
+        "nota": "Nessun extra a nessun orizzonte. Conclusione robusta: il survivorship "
+                "bias gonfia proprio questa tesi (mancano i dislocati al ribasso finiti "
+                "a zero) e nemmeno così emerge qualcosa. Solo watchlist.",
+    },
+    SETUP_SCARICO_CADUTA: {
+        "stato": "Dislocato al ribasso, ancora in caduta",
+        "azione": "NESSUNA",
+        "evidenza": "instabile",
+        "holding": None,
+        "nota": "Il segno si ribalta fra 20 e 40 sedute: positivo sugli orizzonti brevi, "
+                "nettamente negativo sui lunghi. Non temporizzabile.",
+    },
+}
+
+SETUP_ORDINE = list(SETUP_VERDETTO.keys())
+
+# =============================================================================
 # SOGLIE DI CLASSIFICAZIONE SETUP
 # =============================================================================
 # Volutamente permissive: lo screener e' un filtro di primo livello, non un
@@ -201,15 +273,15 @@ COLORS = {
     "neutral": "#8A8FA3",
 }
 
-# Colori per famiglia di setup (usati in tabella e scatter)
+# Colori per stato. La scala segue l'AZIONE validata, non la direzione del
+# movimento: rosso acceso dove c'e' evidenza operativa, toni neutri dove non
+# c'e', cosi' la mappa si legge per operativita' e non per colore del prezzo.
 SETUP_COLORS = {
-    "MR-LONG": "#00D26A",
-    "MR-SHORT": "#FF6B6B",
-    "TREND-UP": "#4CC9F0",
-    "TREND-DN": "#F72585",
-    "VOL-LOW": "#FFC107",
-    "VOL-HIGH": "#9D4EDD",
-    "—": "#8A8FA3",
+    SETUP_ESTESO_FORTE: "#FF4B4B",
+    SETUP_ESTESO_DEBOLE: "#F72585",
+    SETUP_SCARICO_FERMO: "#4CC9F0",
+    SETUP_SCARICO_CADUTA: "#8A8FA3",
+    "—": "#5A5F73",
 }
 
 DEFAULT_MAX_TRADING_DAYS = 260
