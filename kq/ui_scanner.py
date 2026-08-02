@@ -21,6 +21,12 @@ from kq import data as D
 from kq import scanner as S
 from kq import universe as U
 
+# Chiave di navigazione screener -> analisi single-asset.
+# Non e' la chiave di un widget: e' una richiesta che app.main() consuma
+# all'inizio del run successivo, prima di istanziare qualunque widget.
+NAV_TICKER = "_nav_ticker_richiesto"
+MODALITA_SINGOLO = "📈 Analisi singolo asset"
+
 
 # =============================================================================
 # CARICAMENTO
@@ -61,34 +67,175 @@ def _pannello_contesto(ctx: dict, risultati: pd.DataFrame) -> None:
     getattr(st, livello)(testo)
 
 
+# Livelli di selettività: agiscono sulle grandezze INTERPRETABILI, non sullo score.
+# Lo score è una somma pesata arbitraria e non è calibrato su nulla: "score >= 60"
+# non vuol dire niente in termini di probabilità. La dislocazione in sigma invece
+# ha una coda nota, quindi è su quella che ha senso stringere.
+#
+#   |sigma|   P sotto normalità   attesi su ~650 strumenti
+#     1.5          13.4%                  ~87
+#     2.0           4.6%                  ~30
+#     2.5           1.2%                   ~8
+#     3.0           0.27%                  ~2
+#
+# I rendimenti hanno code più grasse della normale, quindi i conteggi reali sono
+# più alti; l'ordine di grandezza però regge, ed è quello che serve per scegliere.
+LIVELLI_SELETTIVITA = {
+    "Tutti i candidati": {"z": 1.5, "gg": 90, "mom": None},
+    "Selettivo": {"z": 2.0, "gg": 30, "mom": 0.3},
+    "Alta convinzione": {"z": 2.5, "gg": 20, "mom": 0.5},
+}
+
+LIVELLO_KEY = "livello_selettivita"
+LIVELLO_DEFAULT = "Selettivo"
+
+# Vocabolari dei filtri: COSTANTI, mai derivati dai risultati del giorno.
+# Un widget con chiave ripristina la selezione salvata, e Streamlit solleva
+# se un valore salvato non e' fra le opzioni correnti: con opzioni che
+# cambiano di giorno in giorno l'app si romperebbe in modo intermittente.
+SETUP_VALIDI = ["MR-LONG", "MR-SHORT", "TREND-UP", "TREND-DN"]
+TIPI_VALIDI = ["Azione", "ETF"]
+CATEGORIE_VALIDE = sorted({cat for _, cat, _ in C.ETF_UNIVERSE} | {"Large Cap US"})
+
+
+# =============================================================================
+# PERSISTENZA DELLE IMPOSTAZIONI
+# =============================================================================
+# Streamlit ELIMINA lo stato di un widget quando il widget non viene
+# renderizzato: aprendo un candidato nell'analisi single-asset e tornando allo
+# screener, ogni filtro e ogni parametro dell'universo tornerebbe al default.
+# Un `setdefault` non basta — anzi peggiora le cose, perche' rimette il valore
+# di default proprio dopo che quello scelto e' stato eliminato.
+#
+# Le chiavi che NON appartengono a un widget non vengono invece mai riciclate:
+# si tiene quindi una copia speculare li' dentro, si risalva a ogni render e si
+# ripristina all'inizio del run successivo, prima che i widget esistano.
+DEFAULT_IMPOSTAZIONI = {
+    LIVELLO_KEY: LIVELLO_DEFAULT,
+    "f_setup": SETUP_VALIDI,
+    "f_tipo": TIPI_VALIDI,
+    "f_cat": [],
+    "f_vol": [],
+    "f_min_z": 1.0,
+    "f_min_adv": 0,
+    "f_max_gg": 90,
+    "p_anno": 2015,
+    "p_n_stocks": C.UNIVERSE_N_STOCKS,
+    "p_min_adv": C.UNIVERSE_MIN_ADV_USD / 1e6,
+    "p_orizzonte": next(iter(C.HORIZONS)),
+    "p_qc": True,
+}
+_SPECCHIO = "_scr_"
+
+
+def ripristina_impostazioni(screener_attivo: bool) -> None:
+    """
+    Da chiamare in app.main() PRIMA di istanziare qualunque widget.
+
+    La regola e' volutamente binaria, per non dipendere dai tempi con cui
+    Streamlit ricicla lo stato dei widget (che non sono garantiti e cambiano
+    fra versioni):
+
+      - screener A SCHERMO  -> non si tocca nulla. Le chiavi contengono le
+        scelte correnti dell'utente e riscriverle annullerebbe ogni modifica
+        appena fatta, visto che questa funzione gira a ogni run.
+      - screener NASCOSTO   -> le chiavi vengono tenute continuamente idratate
+        dallo specchio. Cosi', qualunque cosa Streamlit decida di eliminare nel
+        frattempo, al ritorno i widget trovano i valori salvati.
+    """
+    if screener_attivo:
+        return
+    for chiave, default in DEFAULT_IMPOSTAZIONI.items():
+        specchio = _SPECCHIO + chiave
+        st.session_state[chiave] = (
+            st.session_state[specchio] if specchio in st.session_state else default
+        )
+
+
+def salva_impostazioni() -> None:
+    """Da chiamare dopo aver creato i widget dello screener."""
+    for chiave in DEFAULT_IMPOSTAZIONI:
+        if chiave in st.session_state:
+            st.session_state[_SPECCHIO + chiave] = st.session_state[chiave]
+
+
+def _applica_livello(df: pd.DataFrame, liv: dict) -> pd.DataFrame:
+    """
+    Filtro per congiunzione. È la congiunzione a rendere raro un candidato:
+    presa singolarmente ogni condizione è comune, tutte insieme no.
+    """
+    out = df[df["Disloc σ"].abs() >= liv["z"]]
+    out = out[out["GG in coda"].fillna(0) <= liv["gg"]]
+    if liv["mom"] is not None:
+        rialzista = out["setup"].isin(["MR-LONG", "TREND-UP"])
+        # "Concorde" = il momentum residuo va davvero nella direzione della tesi,
+        # non si limita a "non peggiora". Stringe soprattutto i setup di mean
+        # reversion, che è esattamente dove conta sapere se ha già girato.
+        concorde = pd.Series(
+            np.where(rialzista,
+                     out["Mom residuo"] >= liv["mom"],
+                     out["Mom residuo"] <= -liv["mom"]),
+            index=out.index,
+        )
+        out = out[concorde.fillna(False)]
+    return out
+
+
 def _filtri(risultati: pd.DataFrame) -> pd.DataFrame:
     """Barra filtri sopra la tabella."""
+    candidati = risultati[risultati["setup"] != "—"]
+    conteggi = {k: len(_applica_livello(candidati, v)) for k, v in LIVELLI_SELETTIVITA.items()}
+
+    # Chiave esplicita + valore inizializzato in app.main(): senza, lo stato del
+    # widget verrebbe riciclato da Streamlit ogni volta che si passa all'altra
+    # modalita' (lo screener non e' renderizzato) e la scelta andrebbe persa.
+    # Niente `index=`: il valore iniziale arriva dalla session_state.
+    livello = st.radio(
+        "Selettività",
+        list(LIVELLI_SELETTIVITA.keys()),
+        horizontal=True,
+        key=LIVELLO_KEY,
+        help="Stringe sulla dislocazione in σ, sulla freschezza e sulla concordanza del "
+             "momentum — non sullo Score, che non è calibrato su nulla. Sotto normalità "
+             "|σ|≥1.5 seleziona il 13% dell'universo, |σ|≥2 il 4.6%, |σ|≥2.5 l'1.2%.",
+    )
+    st.caption(" · ".join(f"**{k}**: {v}" for k, v in conteggi.items()))
+
     c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
 
+    # I vocabolari sono COSTANTI, non derivati dai dati del giorno: con una
+    # chiave, Streamlit ripristina la selezione salvata e solleverebbe un errore
+    # se un'opzione salvata ieri non fosse fra le opzioni di oggi.
+    # Nessun `default=`: il valore iniziale arriva da session_state (vedi
+    # ripristina_impostazioni). Passare entrambi farebbe emettere a Streamlit
+    # un warning di conflitto fra default del widget e Session State API.
     with c1:
-        setups = [s for s in ["MR-LONG", "MR-SHORT", "TREND-UP", "TREND-DN"]
-                  if s in risultati["setup"].unique()]
-        sel_setup = st.multiselect("Setup", setups, default=setups,
+        sel_setup = st.multiselect("Setup", SETUP_VALIDI, key="f_setup",
                                    help="MR = mean reversion su dislocazione idiosincratica. "
                                         "TREND = continuazione con momentum confermato.")
     with c2:
-        tipi = sorted(risultati["Tipo"].dropna().unique().tolist())
-        sel_tipo = st.multiselect("Strumento", tipi, default=tipi)
+        sel_tipo = st.multiselect("Strumento", TIPI_VALIDI, key="f_tipo")
     with c3:
-        cats = sorted(risultati["Categoria"].dropna().unique().tolist())
-        sel_cat = st.multiselect("Categoria", cats, default=[])
+        sel_cat = st.multiselect("Categoria", CATEGORIE_VALIDE, key="f_cat")
     with c4:
-        sel_vol = st.multiselect("Volatilità", ["COMPRESSA", "RICCA", "—"], default=[])
+        sel_vol = st.multiselect("Volatilità", ["COMPRESSA", "RICCA", "—"], key="f_vol")
 
+    # Gli slider sono vincoli AGGIUNTIVI, non sovrascritture: con i valori di
+    # default non vincolano, e possono solo stringere oltre il livello scelto.
+    # Cosi' non entrano in conflitto con il selettore di selettività e possono
+    # avere una chiave che ne fa sopravvivere il valore ai cambi di modalità.
     c5, c6, c7 = st.columns([2, 2, 2])
     with c5:
-        min_score = st.slider("Score minimo", 0, 100, 0, step=5)
+        min_z = st.slider("Dislocazione minima |σ|", 1.0, 4.0, step=0.1, key="f_min_z",
+                          help="Restrizione aggiuntiva sopra il livello di selettività. "
+                               "È la grandezza con una coda nota, quindi il filtro sensato: "
+                               "sotto normalità |σ|≥2 seleziona il 4.6% dell'universo, |σ|≥2.5 l'1.2%.")
     with c6:
-        min_adv = st.slider("ADV minimo (M$)", 0, 500, 0, step=10)
+        min_adv = st.slider("ADV minimo (M$)", 0, 500, step=10, key="f_min_adv")
     with c7:
-        max_gg = st.slider("Max giorni in coda", 0, 90, 90, step=5,
-                           help="Un titolo fermo in coda da mesi è un trend, non un'anomalia. "
-                                "Abbassa questo valore per tenere solo le dislocazioni fresche.")
+        max_gg = st.slider("Max giorni in coda", 0, 90, step=5, key="f_max_gg",
+                           help="Restrizione aggiuntiva. Un titolo fermo in coda da mesi è un "
+                                "trend, non un'anomalia.")
 
     out = risultati.copy()
     if sel_setup:
@@ -101,9 +248,12 @@ def _filtri(risultati: pd.DataFrame) -> pd.DataFrame:
         out = out[out["Categoria"].isin(sel_cat)]
     if sel_vol:
         out = out[out["vol_flag"].isin(sel_vol)]
-    out = out[out["Score"].fillna(0) >= min_score]
+
+    liv = LIVELLI_SELETTIVITA[livello]
+    out = _applica_livello(out, {**liv,
+                                 "z": max(liv["z"], min_z),
+                                 "gg": min(liv["gg"], max_gg)})
     out = out[out["ADV M$"].fillna(0) >= min_adv]
-    out = out[out["GG in coda"].fillna(0) <= max_gg]
 
     return out
 
@@ -118,7 +268,7 @@ def _tabella(df: pd.DataFrame) -> None:
 
     st.dataframe(
         vis,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=min(700, 40 + 35 * max(len(vis), 1)),
         column_config={
@@ -176,14 +326,26 @@ def _dettaglio_candidato(df: pd.DataFrame) -> None:
             f"{r.Ticker} — {r.setup} · score {r.Score:.0f} · {r['Disloc σ']:+.2f}σ"
             for _, r in df.head(60).iterrows()
         ]
-        scelta = st.selectbox("Candidato", opzioni, index=0, label_visibility="collapsed")
+        # Le opzioni cambiano a ogni scansione e a ogni cambio di filtro: un
+        # valore salvato che non esiste piu' fra le opzioni farebbe sollevare
+        # Streamlit. Si scarta prima di creare il widget, cosi' la selezione
+        # sopravvive finche' il candidato e' ancora in lista e si azzera quando
+        # non lo e' piu'.
+        if "f_candidato" in st.session_state and st.session_state["f_candidato"] not in opzioni:
+            del st.session_state["f_candidato"]
+        scelta = st.selectbox("Candidato", opzioni, key="f_candidato",
+                              label_visibility="collapsed")
         ticker_sel = scelta.split(" — ")[0]
 
     with c2:
-        if st.button("📈 Apri analisi completa", type="primary", use_container_width=True):
+        if st.button("📈 Apri analisi completa", type="primary", width="stretch"):
             riga = df[df["Ticker"] == ticker_sel].iloc[0]
-            st.session_state["ticker_input"] = riga["ticker_eodhd"]
-            st.session_state["modalita"] = "📈 Analisi singolo asset"
+            # Si deposita solo una RICHIESTA di navigazione: scrivere qui
+            # direttamente in session_state["modalita"] solleverebbe
+            # StreamlitAPIException, perche' il radio con quella chiave e' gia'
+            # stato istanziato in questo run. La richiesta viene consumata da
+            # app.main() all'inizio del run successivo, prima dei widget.
+            st.session_state[NAV_TICKER] = riga["ticker_eodhd"]
             st.rerun()
 
     riga = df[df["Ticker"] == ticker_sel].iloc[0]
@@ -201,7 +363,7 @@ def _dettaglio_candidato(df: pd.DataFrame) -> None:
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        st.dataframe(comp, hide_index=True, use_container_width=True,
+        st.dataframe(comp, hide_index=True, width="stretch",
                      column_config={
                          "Peso": st.column_config.NumberColumn(format="%.2f"),
                          "Valore (0-1)": st.column_config.NumberColumn(format="%.2f"),
@@ -249,7 +411,7 @@ def _esclusi(ctx: dict) -> None:
         vis.index = [t.replace(".US", "") for t in vis.index]
         vis.columns = ["Osservazioni", "Giorni fermo", "Max |ret| giorno",
                        "GG volume 0", "Motivo"]
-        st.dataframe(vis.sort_values("Motivo"), use_container_width=True)
+        st.dataframe(vis.sort_values("Motivo"), width="stretch")
 
 
 # =============================================================================
@@ -279,27 +441,29 @@ def render(api_key: str) -> None:
 
     # --- Parametri ----------------------------------------------------------
     with st.expander("⚙️ Parametri universo e scansione", expanded=False):
+        # Tutti con chiave: altrimenti tornando dall'analisi single-asset i
+        # parametri si azzerano e lo screener riscarica l'universo con impostazioni
+        # diverse da quelle scelte.
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            anno_inizio = st.slider("Storia dal", 2005, 2022, 2015, step=1,
+            anno_inizio = st.slider("Storia dal", 2005, 2022, step=1, key="p_anno",
                                     help="Il costo di download è identico: una chiamata EODHD dal 2015 "
                                          "o dal 2020 è la stessa chiamata. Più storia significa stime di "
                                          "volatilità e percentili storici migliori, non più tempo di attesa.")
         with c2:
-            n_stocks = st.slider("N. azioni in universo", 100, 1000,
-                                 C.UNIVERSE_N_STOCKS, step=50,
+            n_stocks = st.slider("N. azioni in universo", 100, 1000, step=50, key="p_n_stocks",
                                  help="Ordinate per controvalore scambiato decrescente. "
                                       "Il dollar volume è il proxy di liquidità delle opzioni.")
         with c3:
-            min_adv = st.number_input("ADV minimo (M$)",
-                                      value=C.UNIVERSE_MIN_ADV_USD / 1e6, step=5.0, min_value=0.0,
+            min_adv = st.number_input("ADV minimo (M$)", key="p_min_adv",
+                                      step=5.0, min_value=0.0,
                                       help="Non applicato agli ETF: molti settoriali scambiano poco "
                                            "ma hanno catene opzioni liquide.")
         with c4:
-            orizzonte = st.selectbox("Orizzonte", list(C.HORIZONS.keys()), index=0)
+            orizzonte = st.selectbox("Orizzonte", list(C.HORIZONS.keys()), key="p_orizzonte")
 
         applica_qc = st.checkbox(
-            "Applica i controlli qualità dato (consigliato)", value=True,
+            "Applica i controlli qualità dato (consigliato)", key="p_qc",
             help="Esclude serie ferme, con storia insufficiente, con salti giornalieri "
                  "oltre il 35% o senza scambi.")
 
@@ -340,7 +504,7 @@ def render(api_key: str) -> None:
     # --- Mappa --------------------------------------------------------------
     st.markdown("#### 🗺️ Mappa dei candidati")
     candidati = risultati[risultati["setup"] != "—"]
-    st.plotly_chart(charts.build_screener_map(candidati), use_container_width=True)
+    st.plotly_chart(charts.build_screener_map(candidati), width="stretch")
 
     conteggi = ctx["conteggio_setup"]
     cols = st.columns(5)
@@ -353,6 +517,9 @@ def render(api_key: str) -> None:
     # --- Tabella ------------------------------------------------------------
     st.markdown("#### 📋 Candidati")
     filtrati = _filtri(risultati)
+    # Tutti i widget dello screener esistono ora: se ne salva lo stato prima che
+    # il pulsante di drill-down possa far cambiare pagina.
+    salva_impostazioni()
 
     if filtrati.empty:
         st.info("Nessun candidato con i filtri correnti.")
@@ -376,10 +543,10 @@ def render(api_key: str) -> None:
     c1, c2 = st.columns([1, 1])
     with c1:
         st.markdown("#### 📊 Distribuzione della dislocazione")
-        st.plotly_chart(charts.build_breadth_chart(risultati), use_container_width=True)
+        st.plotly_chart(charts.build_breadth_chart(risultati), width="stretch")
     with c2:
         st.markdown("#### 🧭 Dislocazione per categoria")
-        st.plotly_chart(charts.build_category_chart(risultati), use_container_width=True)
+        st.plotly_chart(charts.build_category_chart(risultati), width="stretch")
 
     _esclusi(ctx)
 
