@@ -247,10 +247,13 @@ def build_screener_map(df: pd.DataFrame, max_labels: int = 25) -> go.Figure:
     residuo di breve (y). Sono i due assi su cui e' costruita la
     classificazione, quindi i quadranti coincidono con i setup:
 
-        in basso a sinistra  -> TREND-DN : dislocato e ANCORA in caduta
-        in alto a sinistra   -> MR-LONG  : dislocato ma ha smesso di scendere
-        in alto a destra     -> TREND-UP : forte e ancora in corsa
-        in basso a destra    -> MR-SHORT : forte ma ha smesso di salire
+        in basso a sinistra  -> ↓↓ IN CADUTA    (giu' e ancora in discesa)
+        in alto a sinistra   -> ↓ STABILIZZATO  (giu' ma ha smesso di scendere)
+        in alto a destra     -> ↑↑ ESTESO       (su e ancora in salita)
+        in basso a destra    -> ↑ ESAURITO      (su ma ha girato in giu')
+
+    Il colore segue l'AZIONE validata, non il quadrante: i due stati di destra
+    si operano entrambi al RIBASSO, quelli di sinistra non si operano affatto.
 
     L'asse Y NON usa la velocity del rank percentile: essendo limitata in
     [0,100] satura, e un titolo gia' all'ultimo posto avrebbe velocity zero
