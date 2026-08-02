@@ -100,30 +100,50 @@ def quality_control(close: pd.DataFrame, volume: pd.DataFrame,
     qc["staleness_days"] = staleness
     qc["max_abs_ret_252"] = returns.tail(252).abs().max()
     qc["zero_vol_days_20"] = (volume.tail(20) <= 0).sum()
+    qc["vol_63"] = returns.tail(C.WIN_VOL_LONG).std()
 
     qc["ok_storia"] = qc["n_obs"] >= C.QC_MIN_OBS
     qc["ok_fresco"] = qc["staleness_days"] <= C.QC_MAX_STALENESS_DAYS
     qc["ok_serie"] = qc["max_abs_ret_252"] <= C.QC_MAX_ABS_DAILY_RET
     qc["ok_scambi"] = qc["zero_vol_days_20"] <= C.QC_MAX_ZERO_VOL_DAYS
+    # Serie DEGENERE: prezzo identico giorno dopo giorno. Capita con i titoli
+    # sospesi, di cui EODHD continua a riportare l'ultima chiusura. Superano
+    # tutti gli altri controlli (non hanno salti, non sono "ferme", hanno un
+    # volume) ma hanno varianza nulla, e a valle mandano a zero il denominatore
+    # di ogni normalizzazione. Vanno intercettate qui.
+    qc["ok_movimento"] = qc["vol_63"] > 0
 
-    qc["eleggibile"] = qc[["ok_storia", "ok_fresco", "ok_serie", "ok_scambi"]].all(axis=1)
+    qc["eleggibile"] = qc[
+        ["ok_storia", "ok_fresco", "ok_serie", "ok_scambi", "ok_movimento"]
+    ].all(axis=1)
 
+    # I motivi vanno formattati difendendosi dai NaN: una colonna interamente
+    # vuota non ha una data di ultima quotazione, quindi staleness e' NaN e un
+    # int() secco farebbe cadere la pagina ("cannot convert float NaN to integer").
+    # Le voci non calcolabili si omettono invece di stampare "n/d": se non c'e'
+    # nessun dato il motivo e' uno solo, non quattro.
     motivi = []
     for t in qc.index:
         r = qc.loc[t]
         if r["eleggibile"]:
             motivi.append("")
             continue
+        if r["n_obs"] == 0:
+            motivi.append("nessun dato nel periodo")
+            continue
+
         m = []
         if not r["ok_storia"]:
             m.append(f"storia {int(r['n_obs'])}gg")
-        if not r["ok_fresco"]:
+        if not r["ok_fresco"] and not pd.isna(r["staleness_days"]):
             m.append(f"fermo da {int(r['staleness_days'])}gg")
-        if not r["ok_serie"]:
+        if not r["ok_serie"] and not pd.isna(r["max_abs_ret_252"]):
             m.append(f"salto {r['max_abs_ret_252']:.0%}")
         if not r["ok_scambi"]:
             m.append("volumi nulli")
-        motivi.append(", ".join(m))
+        if not r["ok_movimento"]:
+            m.append("prezzo fermo (serie degenere)")
+        motivi.append(", ".join(m) or "dati non utilizzabili")
     qc["motivo_esclusione"] = motivi
 
     return qc
@@ -252,7 +272,11 @@ def run_screen(
     giorni_in_coda = giorni_coda_bassa.where(giorni_coda_bassa > 0, giorni_coda_alta)
 
     # --- Volatilita' ---------------------------------------------------------
+    # Il .where(>0) e' una rete di sicurezza: i controlli qualita' scartano gia'
+    # le serie a varianza nulla, ma sigma finisce a denominatore di ogni
+    # normalizzazione e uno zero superstite propagherebbe inf silenziosi.
     sigma_ann = returns[validi].rolling(C.WIN_VOL_LONG).std().iloc[-1] * np.sqrt(252)
+    sigma_ann = sigma_ann.where(sigma_ann > 0)
     rv = returns[validi].rolling(C.WIN_VOL_SHORT).std() * np.sqrt(252)
     rv_now = rv.iloc[-1]
     n_rv = rv.notna().sum()
