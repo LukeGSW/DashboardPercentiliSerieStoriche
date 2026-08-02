@@ -179,48 +179,83 @@ def render(api_key: str) -> None:
     st.caption(f"Celle da testare: **{n_celle}** (4 setup × {len(livelli_sel)} livelli "
                f"× {len(holdings)} orizzonti di detenzione)")
 
-    if not st.button("🚀 Esegui la validazione", type="primary"):
+    anno = st.session_state.get("p_anno", 2015)
+    n_stocks = st.session_state.get("p_n_stocks", C.UNIVERSE_N_STOCKS)
+    # Identifica in modo univoco i parametri di questa esecuzione: serve a
+    # riconoscere quando i risultati mostrati non corrispondono piu' ai comandi.
+    firma = (orizzonte, tuple(sorted(holdings)), tuple(sorted(livelli_sel)),
+             int(rebalance), float(costo), int(n_boot), int(n_placebo), anno, n_stocks)
+
+    if st.button("🚀 Esegui la validazione", type="primary"):
+        with st.spinner("Caricamento pannello prezzi…"):
+            uni, close, volume = ui_scanner._load_everything(
+                f"{anno}-01-01", n_stocks, C.UNIVERSE_MIN_PRICE, api_key)
+
+        if close.empty:
+            st.error("Pannello prezzi non disponibile. Apri prima lo screener.")
+            return
+
+        with st.spinner("Calcolo dei segnali storici (una passata su tutte le finestre mobili)…"):
+            sig = V.precompute_signals(close, volume, uni, horizon_label=orizzonte,
+                                       min_adv_usd=st.session_state.get("p_min_adv", 30.0) * 1e6)
+        if not sig:
+            st.error("Nessuno strumento utilizzabile per la validazione.")
+            return
+
+        livelli = {k: ui_scanner.LIVELLI_SELETTIVITA[k] for k in livelli_sel}
+        with st.spinner(f"Event study su {n_celle} celle…"):
+            out = V.event_study(sig, close, livelli, holdings=tuple(sorted(holdings)),
+                                rebalance=int(rebalance), costo_bps=float(costo),
+                                n_boot=int(n_boot), n_placebo=int(n_placebo))
+
+        if out.empty:
+            st.warning("Nessun risultato: storia insufficiente per i parametri scelti.")
+            return
+
+        # I risultati vivono in session_state, NON dentro il blocco del pulsante:
+        # altrimenti qualunque interazione successiva (il menu a tendina del
+        # dettaglio, un filtro) farebbe ripartire il run col pulsante a False e
+        # la pagina tornerebbe vuota.
+        st.session_state["_val_out"] = out
+        st.session_state["_val_meta"] = {
+            "self_bench": sig["n_esclusi_self_bench"],
+            "sporchi": sig["n_esclusi_sporchi"],
+            "costo": float(costo),
+            "rebalance": int(rebalance),
+            "orizzonte": orizzonte,
+        }
+        st.session_state["_val_firma"] = firma
+
+    out = st.session_state.get("_val_out")
+    if out is None:
         st.info("Lo studio è pesante (decine di secondi): parte solo su richiesta.")
         return
 
-    # --- Dati ---------------------------------------------------------------
-    anno = st.session_state.get("p_anno", 2015)
-    n_stocks = st.session_state.get("p_n_stocks", C.UNIVERSE_N_STOCKS)
-    with st.spinner("Caricamento pannello prezzi…"):
-        uni, close, volume = ui_scanner._load_everything(
-            f"{anno}-01-01", n_stocks, C.UNIVERSE_MIN_PRICE, api_key)
+    if st.session_state.get("_val_firma") != firma:
+        st.warning("⚠️ I parametri sono stati modificati dopo l'ultima esecuzione: "
+                   "la tabella qui sotto si riferisce ancora ai parametri precedenti. "
+                   "Premi **Esegui la validazione** per aggiornarla.")
 
-    if close.empty:
-        st.error("Pannello prezzi non disponibile. Apri prima lo screener.")
-        return
-
-    with st.spinner("Calcolo dei segnali storici (una passata su tutte le finestre mobili)…"):
-        sig = V.precompute_signals(close, volume, uni, horizon_label=orizzonte,
-                                   min_adv_usd=st.session_state.get("p_min_adv", 30.0) * 1e6)
-
-    if not sig:
-        st.error("Nessuno strumento utilizzabile per la validazione.")
-        return
-
-    livelli = {k: ui_scanner.LIVELLI_SELETTIVITA[k] for k in livelli_sel}
-    with st.spinner(f"Event study su {n_celle} celle…"):
-        out = V.event_study(sig, close, livelli, holdings=tuple(sorted(holdings)),
-                            rebalance=int(rebalance), costo_bps=float(costo),
-                            n_boot=int(n_boot), n_placebo=int(n_placebo))
-
-    if out.empty:
-        st.warning("Nessun risultato: storia insufficiente per i parametri scelti.")
-        return
-
-    st.session_state["_val_risultati"] = out
-    _mostra(out, sig, close)
+    _mostra(out, st.session_state.get("_val_meta", {}))
 
 
-def _mostra(out: pd.DataFrame, sig: dict, close: pd.DataFrame) -> None:
+def _mostra(out: pd.DataFrame, meta: dict) -> None:
     mis = out[out["misurabile"]].copy()
 
     st.markdown("---")
     st.markdown("### 📋 Esiti")
+
+    # Il costo va reso esplicito accanto ai risultati: e' il parametro che sposta
+    # ogni riga di una quantita' fissa, ed e' facile leggere una tabella senza
+    # ricordarsi con quale ipotesi e' stata prodotta.
+    costo = meta.get("costo")
+    if costo is not None:
+        nota = "" if costo >= 5 else "  ⚠️ irrealisticamente basso per un andata+ritorno"
+        st.caption(
+            f"Orizzonte **{meta.get('orizzonte', '?')}** · rilevazione ogni "
+            f"**{meta.get('rebalance', '?')}** sedute · costo **{costo:g} bps** "
+            f"(sposta ogni Extra netto di **{-costo / 100:+.3f} pp**){nota}"
+        )
 
     c = st.columns(5)
     c[0].metric("Celle misurabili", f"{len(mis)}/{len(out)}")
@@ -245,6 +280,10 @@ def _mostra(out: pd.DataFrame, sig: dict, close: pd.DataFrame) -> None:
     st.markdown("### 🔬 Dettaglio")
     etichette = [f"{r.Setup} · {r.Livello} · holding {r.Holding}gg  →  {r.Esito}"
                  for _, r in mis.iterrows()]
+    # Le etichette cambiano a ogni nuova esecuzione: un valore salvato che non
+    # esiste piu' fra le opzioni farebbe sollevare Streamlit.
+    if "v_cella" in st.session_state and st.session_state["v_cella"] not in etichette:
+        del st.session_state["v_cella"]
     scelta = st.selectbox("Cella", etichette, key="v_cella")
     riga = mis.iloc[etichette.index(scelta)]
 
@@ -290,11 +329,11 @@ def _mostra(out: pd.DataFrame, sig: dict, close: pd.DataFrame) -> None:
 
     with st.expander("📐 Cosa è stato escluso e perché"):
         st.markdown(f"""
-        - **{sig['n_esclusi_self_bench']}** strumenti che sono benchmark di se stessi
+        - **{meta.get('self_bench', '?')}** strumenti che sono benchmark di se stessi
           (SPY, TLT, GLD…): misurano la dislocazione sulla propria storia stagionale, e
           una versione causale richiederebbe una mediana espandente condizionata al
           trading day. Sono fuori dalla validazione, non dallo screener.
-        - **{sig['n_esclusi_sporchi']}** serie con un salto giornaliero oltre il
+        - **{meta.get('sporchi', '?')}** serie con un salto giornaliero oltre il
           {C.QC_MAX_ABS_DAILY_RET:.0%}, escluse per l'**intero campione**: un concambio non
           gestito corrompe la serie in modo retroattivo, e su una misura ordinata per
           estremità quelle serie dominerebbero la classifica.
