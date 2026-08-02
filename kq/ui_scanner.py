@@ -19,6 +19,7 @@ from kq import charts
 from kq import config as C
 from kq import data as D
 from kq import scanner as S
+from kq import state
 from kq import universe as U
 
 # Chiave di navigazione screener -> analisi single-asset.
@@ -99,17 +100,8 @@ CATEGORIE_VALIDE = sorted({cat for _, cat, _ in C.ETF_UNIVERSE} | {"Large Cap US
 
 
 # =============================================================================
-# PERSISTENZA DELLE IMPOSTAZIONI
+# PERSISTENZA DELLE IMPOSTAZIONI  (meccanica in kq.state)
 # =============================================================================
-# Streamlit ELIMINA lo stato di un widget quando il widget non viene
-# renderizzato: aprendo un candidato nell'analisi single-asset e tornando allo
-# screener, ogni filtro e ogni parametro dell'universo tornerebbe al default.
-# Un `setdefault` non basta — anzi peggiora le cose, perche' rimette il valore
-# di default proprio dopo che quello scelto e' stato eliminato.
-#
-# Le chiavi che NON appartengono a un widget non vengono invece mai riciclate:
-# si tiene quindi una copia speculare li' dentro, si risalva a ogni render e si
-# ripristina all'inizio del run successivo, prima che i widget esistano.
 DEFAULT_IMPOSTAZIONI = {
     LIVELLO_KEY: LIVELLO_DEFAULT,
     "f_setup": SETUP_VALIDI,
@@ -129,34 +121,13 @@ _SPECCHIO = "_scr_"
 
 
 def ripristina_impostazioni(screener_attivo: bool) -> None:
-    """
-    Da chiamare in app.main() PRIMA di istanziare qualunque widget.
-
-    La regola e' volutamente binaria, per non dipendere dai tempi con cui
-    Streamlit ricicla lo stato dei widget (che non sono garantiti e cambiano
-    fra versioni):
-
-      - screener A SCHERMO  -> non si tocca nulla. Le chiavi contengono le
-        scelte correnti dell'utente e riscriverle annullerebbe ogni modifica
-        appena fatta, visto che questa funzione gira a ogni run.
-      - screener NASCOSTO   -> le chiavi vengono tenute continuamente idratate
-        dallo specchio. Cosi', qualunque cosa Streamlit decida di eliminare nel
-        frattempo, al ritorno i widget trovano i valori salvati.
-    """
-    if screener_attivo:
-        return
-    for chiave, default in DEFAULT_IMPOSTAZIONI.items():
-        specchio = _SPECCHIO + chiave
-        st.session_state[chiave] = (
-            st.session_state[specchio] if specchio in st.session_state else default
-        )
+    """Da chiamare in app.main() PRIMA di istanziare qualunque widget."""
+    state.ripristina(DEFAULT_IMPOSTAZIONI, _SPECCHIO, screener_attivo)
 
 
 def salva_impostazioni() -> None:
     """Da chiamare dopo aver creato i widget dello screener."""
-    for chiave in DEFAULT_IMPOSTAZIONI:
-        if chiave in st.session_state:
-            st.session_state[_SPECCHIO + chiave] = st.session_state[chiave]
+    state.salva(DEFAULT_IMPOSTAZIONI, _SPECCHIO)
 
 
 def _applica_livello(df: pd.DataFrame, liv: dict) -> pd.DataFrame:
