@@ -35,7 +35,8 @@ IL LIMITE CHE NON SI PUO' TOGLIERE
 L'universo e' costruito sui membri di oggi. Le societa' dislocate che sono
 risalite ci sono; quelle andate a zero sono uscite e non compaiono da nessuna
 parte. Il bias spinge quindi A FAVORE della tesi contrarian, e un risultato
-positivo su MR-LONG va letto come LIMITE SUPERIORE, non come stima. Il modulo
+positivo sugli stati dislocati al RIBASSO va letto come LIMITE SUPERIORE, non
+come stima. Il modulo
 riporta la "copertura" (quota di segnalati con un forward calcolabile) proprio
 per rendere visibile quanto il problema sia invisibile in questi dati.
 =============================================================================
@@ -58,7 +59,31 @@ MIN_NOMI_PER_DATA = 3
 # Numero minimo di date valide per considerare misurabile una cella.
 MIN_DATE = 24
 
-DIREZIONE_TESI = {"MR-LONG": +1, "TREND-UP": +1, "MR-SHORT": -1, "TREND-DN": -1}
+# Segno con cui si misura l'extra, derivato dall'AZIONE dichiarata in config:
+#   -1  azione ribassista -> extra positivo significa "i segnalati sono scesi
+#       rispetto all'universo", cioe' l'operazione avrebbe funzionato
+#   +1  nessuna azione (o azione rialzista) -> si misura l'extra GREZZO:
+#       positivo = i segnalati hanno sovraperformato l'universo
+#
+# NOTA DI ONESTA': per gli stati la cui azione e' stata fissata DOPO aver visto
+# questi stessi dati, il semaforo e' in-sample per costruzione. Vale come
+# ipotesi da confermare su dati nuovi, non come risultato out-of-sample.
+DIREZIONE_TESI = {
+    nome: (-1 if v["azione"] == "RIBASSISTA" else +1)
+    for nome, v in C.SETUP_VERDETTO.items()
+}
+
+# Verso del momentum residuo che DEFINISCE lo stato. E' cosa diversa dalla
+# direzione dell'azione, e va tenuta separata: uno strumento esteso al rialzo
+# ha momentum positivo per definizione, ma si opera al ribasso. Confondere le
+# due cose rovescerebbe il filtro di selettivita', che stringe sulla purezza
+# dello STATO, non sulla direzione dell'operazione.
+VERSO_STATO = {
+    C.SETUP_ESTESO_FORTE: +1,     # dislocato su e ancora in salita
+    C.SETUP_SCARICO_FERMO: +1,    # dislocato giu' ma in risalita
+    C.SETUP_ESTESO_DEBOLE: -1,    # dislocato su ma ha girato in giu'
+    C.SETUP_SCARICO_CADUTA: -1,   # dislocato giu' e ancora in discesa
+}
 
 
 # =============================================================================
@@ -204,10 +229,10 @@ def maschere_setup(sig: dict) -> dict[str, pd.DataFrame]:
     migliora = mom >= 0.5
 
     return {
-        "MR-LONG": strong_dn & ~peggiora,
-        "TREND-DN": strong_dn & peggiora,
-        "MR-SHORT": strong_up & ~migliora,
-        "TREND-UP": strong_up & migliora,
+        C.SETUP_SCARICO_FERMO: strong_dn & ~peggiora,
+        C.SETUP_SCARICO_CADUTA: strong_dn & peggiora,
+        C.SETUP_ESTESO_DEBOLE: strong_up & ~migliora,
+        C.SETUP_ESTESO_FORTE: strong_up & migliora,
     }
 
 
@@ -215,7 +240,7 @@ def filtro_livello(sig: dict, maschera: pd.DataFrame, setup: str, liv: dict) -> 
     """Applica un livello di selettivita' (stessa congiunzione della UI)."""
     out = maschera & (sig["disloc_z"].abs() >= liv["z"]) & (sig["gg_coda"] <= liv["gg"])
     if liv["mom"] is not None:
-        if DIREZIONE_TESI[setup] > 0:
+        if VERSO_STATO[setup] > 0:
             out &= sig["resid_mom"] >= liv["mom"]
         else:
             out &= sig["resid_mom"] <= -liv["mom"]
