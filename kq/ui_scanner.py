@@ -21,6 +21,7 @@ from kq import data as D
 from kq import scanner as S
 from kq import state
 from kq import universe as U
+from kq import validation as V
 
 # Chiave di navigazione screener -> analisi single-asset.
 # Non e' la chiave di un widget: e' una richiesta che app.main() consuma
@@ -94,7 +95,7 @@ LIVELLO_DEFAULT = "Selettivo"
 # Un widget con chiave ripristina la selezione salvata, e Streamlit solleva
 # se un valore salvato non e' fra le opzioni correnti: con opzioni che
 # cambiano di giorno in giorno l'app si romperebbe in modo intermittente.
-SETUP_VALIDI = ["MR-LONG", "MR-SHORT", "TREND-UP", "TREND-DN"]
+SETUP_VALIDI = list(C.SETUP_ORDINE)
 TIPI_VALIDI = ["Azione", "ETF"]
 CATEGORIE_VALIDE = sorted({cat for _, cat, _ in C.ETF_UNIVERSE} | {"Large Cap US"})
 
@@ -138,17 +139,18 @@ def _applica_livello(df: pd.DataFrame, liv: dict) -> pd.DataFrame:
     out = df[df["Disloc σ"].abs() >= liv["z"]]
     out = out[out["GG in coda"].fillna(0) <= liv["gg"]]
     if liv["mom"] is not None:
-        rialzista = out["setup"].isin(["MR-LONG", "TREND-UP"])
-        # "Concorde" = il momentum residuo va davvero nella direzione della tesi,
-        # non si limita a "non peggiora". Stringe soprattutto i setup di mean
-        # reversion, che è esattamente dove conta sapere se ha già girato.
-        concorde = pd.Series(
-            np.where(rialzista,
+        # Si stringe sulla PUREZZA DELLO STATO, non sulla direzione
+        # dell'operazione: uno strumento esteso al rialzo deve avere momentum
+        # nettamente positivo per essere un esemplare puro di quello stato,
+        # anche se poi lo si tratta al ribasso.
+        verso_alto = out["setup"].map(V.VERSO_STATO).fillna(0) > 0
+        puro = pd.Series(
+            np.where(verso_alto,
                      out["Mom residuo"] >= liv["mom"],
                      out["Mom residuo"] <= -liv["mom"]),
             index=out.index,
         )
-        out = out[concorde.fillna(False)]
+        out = out[puro.fillna(False)]
     return out
 
 
@@ -181,9 +183,10 @@ def _filtri(risultati: pd.DataFrame) -> pd.DataFrame:
     # ripristina_impostazioni). Passare entrambi farebbe emettere a Streamlit
     # un warning di conflitto fra default del widget e Session State API.
     with c1:
-        sel_setup = st.multiselect("Setup", SETUP_VALIDI, key="f_setup",
-                                   help="MR = mean reversion su dislocazione idiosincratica. "
-                                        "TREND = continuazione con momentum confermato.")
+        sel_setup = st.multiselect(
+            "Stato", SETUP_VALIDI, key="f_setup",
+            help="Condizione osservata. La direzione operativa non è implicita nel nome: "
+                 "arriva dalla validazione ed è nella colonna Azione.")
     with c2:
         sel_tipo = st.multiselect("Strumento", TIPI_VALIDI, key="f_tipo")
     with c3:
@@ -231,11 +234,12 @@ def _filtri(risultati: pd.DataFrame) -> pd.DataFrame:
 
 def _tabella(df: pd.DataFrame) -> None:
     colonne = [
-        "Ticker", "Nome", "setup", "vol_flag", "Score", "Rend %", "Disloc σ",
-        "Mom residuo", "Rank XS", "Velocity", "GG in coda", "Vol %", "Vol pctl",
-        "Beta", "Benchmark", "Struttura", "Pctl storico", "DD 52w %", "ADV M$",
+        "Ticker", "Nome", "setup", "Azione", "Evidenza", "vol_flag", "Struttura",
+        "Score", "Rend %", "Disloc σ", "Mom residuo", "Rank XS", "Velocity",
+        "GG in coda", "Vol %", "Vol pctl", "Beta", "Benchmark",
+        "Pctl storico", "DD 52w %", "ADV M$",
     ]
-    vis = df[colonne].rename(columns={"setup": "Setup", "vol_flag": "Vol"})
+    vis = df[colonne].rename(columns={"setup": "Stato", "vol_flag": "Vol"})
 
     st.dataframe(
         vis,
@@ -243,11 +247,23 @@ def _tabella(df: pd.DataFrame) -> None:
         hide_index=True,
         height=min(700, 40 + 35 * max(len(vis), 1)),
         column_config={
+            "Stato": st.column_config.TextColumn(
+                help="Descrive la CONDIZIONE osservata, non la strategia: ↑↑/↓↓ = "
+                     "dislocato e ancora in movimento, ↑/↓ = dislocato ma il momentum "
+                     "ha girato."),
+            "Azione": st.column_config.TextColumn(
+                help="Direzione operativa che esce dalla validazione walk-forward. "
+                     "NESSUNA significa che su quello stato non è stato misurato alcun "
+                     "extra rispetto a una selezione casuale."),
+            "Evidenza": st.column_config.TextColumn(
+                help="confermata = effetto misurato, monotono e stabile out-of-sample · "
+                     "debole = stessa direzione ma non significativo · "
+                     "assente = nessun extra · instabile = il segno cambia con l'orizzonte."),
             "Score": st.column_config.ProgressColumn(
                 "Score", min_value=0, max_value=100, format="%.0f",
-                help="Euristica di ordinamento, NON una probabilità e non un backtest. "
-                     "Pesi: 40% ampiezza dislocazione, 20% freschezza, 20% stabilizzazione, "
-                     "10% percentile di volatilità, 10% liquidità.",
+                help="Euristica di ordinamento DENTRO uno stato, NON una probabilità. "
+                     "Pesi: 40% ampiezza dislocazione, 20% freschezza, 20% intensità del "
+                     "momentum, 10% percentile di volatilità, 10% liquidità.",
             ),
             "Rend %": st.column_config.NumberColumn(format="%.1f%%"),
             "Disloc σ": st.column_config.NumberColumn(
@@ -320,8 +336,22 @@ def _dettaglio_candidato(df: pd.DataFrame) -> None:
             st.rerun()
 
     riga = df[df["Ticker"] == ticker_sel].iloc[0]
+    verdetto = C.SETUP_VERDETTO.get(riga["setup"], {})
 
     st.markdown(f"**{riga['Ticker']} — {riga['Nome']}**")
+
+    if riga["Azione"] == "NESSUNA":
+        st.warning(
+            f"**{riga['setup']}** — {verdetto.get('stato', '')}. "
+            f"Evidenza **{riga['Evidenza']}**: {verdetto.get('nota', '')}"
+        )
+    else:
+        st.info(
+            f"**{riga['setup']}** — {verdetto.get('stato', '')}. "
+            f"Azione **{riga['Azione']}**, evidenza **{riga['Evidenza']}**, "
+            f"detenzione indicata **{verdetto.get('holding', '?')} sedute** "
+            f"(≈ 30-45 DTE). {verdetto.get('nota', '')}"
+        )
 
     comp = pd.DataFrame({
         "Componente": ["Ampiezza dislocazione", "Freschezza", "Conferma direzionale",
@@ -342,18 +372,19 @@ def _dettaglio_candidato(df: pd.DataFrame) -> None:
                      })
     with c2:
         st.markdown(f"""
-        - **Setup:** `{riga['setup']}` · volatilità **{riga['vol_flag']}**
+        - **Stato:** `{riga['setup']}` · volatilità **{riga['vol_flag']}**
         - **Dislocazione:** {riga['Disloc σ']:+.2f}σ ({riga['Tipo disloc']} `{riga['Benchmark']}`,
           beta {riga['Beta']:.2f}, R² {riga['R²']:.2f})
         - **Momentum residuo 10 sedute:** {riga['Mom residuo']:+.2f}σ
           → {"si sta chiudendo" if (riga['Mom residuo'] > 0) == (riga['Disloc σ'] < 0) else "si sta allargando"}
         - **Rank cross-sectional:** {riga['Rank XS']:.0f}° · in coda da {riga['GG in coda']:.0f} sedute
         - **Volatilità:** {riga['Vol %']:.0f}% annua, {riga['Vol pctl']:.0f}° percentile storico
-        - **Struttura naturale:** {riga['Struttura']}
+        - **Struttura:** {riga['Struttura']}
         """)
         st.caption(
-            "La struttura opzioni è una mappatura meccanica setup × regime di volatilità, "
-            "non un consiglio: serve a ricordare quale payoff è coerente con la tesi."
+            "La struttura è una mappatura meccanica azione validata × regime di volatilità, "
+            "non un consiglio. La direzione NON segue il movimento osservato: uno strumento "
+            "esteso al rialzo si tratta al ribasso, perché è così che ha misurato l'event study."
         )
 
 
@@ -393,20 +424,22 @@ def render(api_key: str) -> None:
 
     st.markdown("""
     <div style="background-color: rgba(100,149,237,0.1); padding: 15px; border-radius: 10px; margin-bottom: 18px;">
-    <b>Cosa fa e cosa non fa</b><br>
-    Questo screener produce una <b>lista di candidati da vagliare</b>, non uno studio.
-    Cerca strumenti la cui performance si è staccata da quella del proprio benchmark
-    più di quanto la loro volatilità giustifichi, e distingue chi si sta
-    <i>stabilizzando</i> da chi sta <i>ancora scendendo</i>.
+    <b>Stato osservato ≠ direzione da prendere</b><br>
+    Lo screener classifica gli strumenti per <b>stato</b> — quanto si sono staccati dal proprio
+    benchmark e in che verso si stanno muovendo ora. La <b>direzione operativa</b> non è implicita
+    nello stato: viene dalla validazione walk-forward, ed è nella colonna <code>Azione</code>.
     <ul>
     <li><b>Dislocazione σ</b> — rendimento in eccesso sul benchmark, normalizzato per volatilità
-    idiosincratica. È la metrica principale: rende confrontabili un ETF obbligazionario e un semiconduttore.</li>
-    <li><b>Mom residuo</b> — direzione <i>attuale</i>: il titolo ha smesso di muoversi contro,
-    o sta ancora andando giù? È questo a separare un rimbalzo da un coltello che cade.</li>
+    idiosincratica. Rende confrontabili un ETF obbligazionario e un semiconduttore.</li>
+    <li><b>Mom residuo</b> — verso in cui si sta muovendo <i>adesso</i>. Separa
+    &ldquo;ha smesso&rdquo; da &ldquo;sta ancora andando&rdquo;.</li>
     <li><b>Rank XS</b> — percentile contro tutto l'universo <i>oggi</i> (~600 campioni), non contro
-    la propria storia (poche annualità). Robusto e immune al survivorship bias dell'universo.</li>
+    la propria storia (poche annualità).</li>
     </ul>
-    La verifica vera si fa a valle, aprendo il singolo candidato nell'analisi completa.
+    <b>⚠️ Il punto che conta:</b> l'event study dice che gli strumenti <b>estesi al rialzo si
+    trattano al RIBASSO</b> — sottoperformano l'universo a tutti gli orizzonti testati. E che sui
+    dislocati al ribasso non c'è nulla da prendere. La colonna <code>Struttura</code> segue questo
+    verdetto, non l'intuizione di seguire il movimento.
     </div>
     """, unsafe_allow_html=True)
 
@@ -479,9 +512,13 @@ def render(api_key: str) -> None:
 
     conteggi = ctx["conteggio_setup"]
     cols = st.columns(5)
-    for i, s in enumerate(["MR-LONG", "MR-SHORT", "TREND-UP", "TREND-DN"]):
-        cols[i].metric(s, conteggi.get(s, 0))
-    cols[4].metric("Nessun setup", conteggi.get("—", 0))
+    for i, s in enumerate(C.SETUP_ORDINE):
+        v = C.SETUP_VERDETTO[s]
+        cols[i].metric(s, conteggi.get(s, 0),
+                       delta=v["azione"] if v["azione"] != "NESSUNA" else "—",
+                       delta_color="off",
+                       help=f"{v['stato']} · evidenza {v['evidenza']}")
+    cols[4].metric("Nessuno stato", conteggi.get("—", 0))
 
     st.markdown("---")
 
