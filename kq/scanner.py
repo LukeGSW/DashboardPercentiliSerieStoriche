@@ -360,11 +360,14 @@ def run_screen(
     peggiora = resid_mom <= -0.5
     migliora = resid_mom >= 0.5
 
+    # I nomi descrivono lo STATO osservato, non la strategia: l'azione da
+    # tenere arriva dal verdetto della validazione (config.SETUP_VERDETTO) e
+    # puo' cambiare senza che cambi la classificazione.
     setup = pd.Series("—", index=validi, dtype=object)
-    setup[strong_dn & ~peggiora] = "MR-LONG"    # dislocato giu', non peggiora piu'
-    setup[strong_dn & peggiora] = "TREND-DN"    # dislocato giu' e ancora in caduta
-    setup[strong_up & ~migliora] = "MR-SHORT"   # dislocato su, ha smesso di salire
-    setup[strong_up & migliora] = "TREND-UP"    # dislocato su e ancora in corsa
+    setup[strong_dn & ~peggiora] = C.SETUP_SCARICO_FERMO
+    setup[strong_dn & peggiora] = C.SETUP_SCARICO_CADUTA
+    setup[strong_up & ~migliora] = C.SETUP_ESTESO_DEBOLE
+    setup[strong_up & migliora] = C.SETUP_ESTESO_FORTE
 
     vol_flag = pd.Series("—", index=validi, dtype=object)
     vol_flag[rv_pctl <= C.TH_VOL_LOW] = "COMPRESSA"
@@ -376,11 +379,13 @@ def run_screen(
     s_disloc = (disloc_z.abs() / 3.0).clip(0, 1)
     s_fresh = ((C.TH_STALE_DAYS - giorni_in_coda.reindex(validi).fillna(0))
                / (C.TH_STALE_DAYS - C.TH_FRESH_DAYS)).clip(0, 1)
-    # Conferma direzionale: quanto il momentum residuo di breve va nella
-    # direzione implicita dal setup. Usa resid_mom, non la velocity di rank.
-    direzione_rialzista = setup.isin(["MR-LONG", "TREND-UP"])
+    # Intensita' del momentum NELLA DIREZIONE CHE DEFINISCE LO STATO: piu' uno
+    # strumento e' esteso (o piu' nettamente si e' fermato), piu' e' un esemplare
+    # puro di quello stato. Non e' una previsione di direzione — la direzione
+    # operativa la stabilisce la validazione, non lo score.
+    mom_verso_alto = setup.isin([C.SETUP_ESTESO_FORTE, C.SETUP_SCARICO_FERMO])
     s_stab = pd.Series(
-        np.where(direzione_rialzista,
+        np.where(mom_verso_alto,
                  (resid_mom / 2.0).clip(0, 1),
                  (-resid_mom / 2.0).clip(0, 1)),
         index=validi,
@@ -398,22 +403,35 @@ def run_screen(
     score = score.where(setup != "—", np.nan)
 
     # =========================================================================
-    # 7. STRUTTURA OPZIONI NATURALE (mappatura meccanica, non un consiglio)
+    # 7. AZIONE E STRUTTURA IN OPZIONI
     # =========================================================================
+    # La struttura deriva dall'AZIONE VALIDATA incrociata col regime di
+    # volatilita', non dalla direzione del movimento osservato. E' la differenza
+    # che conta: uno strumento esteso al rialzo si tratta al RIBASSO, perche' e'
+    # cosi' che ha misurato l'event study.
     def _struttura(row) -> str:
-        s, v = row["setup"], row["vol_flag"]
-        if s == "MR-LONG":
-            return "Bull put spread / vendita put" if v == "RICCA" else "Call debit spread"
-        if s == "MR-SHORT":
-            return "Bear call spread / vendita call" if v == "RICCA" else "Put debit spread"
-        if s == "TREND-UP":
-            return "Call diagonal / long call" if v == "COMPRESSA" else "Bull call spread"
-        if s == "TREND-DN":
-            return "Long put / put diagonal" if v == "COMPRESSA" else "Bear put spread"
+        azione, v = row["Azione"], row["vol_flag"]
+
+        if azione == "RIBASSISTA":
+            if v == "RICCA":
+                return "Bear call spread / vendita call"
+            if v == "COMPRESSA":
+                return "Put debit spread / long put"
+            return "Bear call spread"
+
+        if azione == "RIALZISTA":
+            if v == "RICCA":
+                return "Bull put spread / vendita put"
+            if v == "COMPRESSA":
+                return "Call debit spread / long call"
+            return "Bull put spread"
+
+        # Nessuna azione direzionale validata: resta solo l'informazione sul
+        # regime di volatilita', che e' indipendente dallo stato del prezzo.
         if v == "COMPRESSA":
-            return "Long straddle / strangle"
+            return "Solo vol: long straddle / strangle"
         if v == "RICCA":
-            return "Short strangle / iron condor"
+            return "Solo vol: short strangle / iron condor"
         return "—"
 
     # =========================================================================
@@ -429,6 +447,9 @@ def run_screen(
         "Categoria": meta["categoria"].reindex(validi).values,
         "Benchmark": [str(b).replace(".US", "") for b in bench_map.values],
         "setup": setup.values,
+        "Azione": [C.SETUP_VERDETTO.get(s, {}).get("azione", "—") for s in setup],
+        "Evidenza": [C.SETUP_VERDETTO.get(s, {}).get("evidenza", "—") for s in setup],
+        "Holding": [C.SETUP_VERDETTO.get(s, {}).get("holding") for s in setup],
         "vol_flag": vol_flag.values,
         "Score": score.values,
         "Rend %": (hret.reindex(validi) * 100).values,
