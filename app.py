@@ -39,28 +39,58 @@ from kq import ui_scanner         # noqa: E402
 from kq import ui_single          # noqa: E402
 
 
+# L'analisi singolo asset e' la prima voce, quindi il default: lo screener scarica
+# l'intero universo al primo avvio (~1 minuto) e non ha senso pagarlo a ogni
+# apertura dell'app. Si entra nello screener quando lo si vuole.
+MODALITA = ["📈 Analisi singolo asset", "🔍 Screener multi-asset"]
+
+
+def _applica_navigazione_pendente() -> None:
+    """
+    Consuma la richiesta di navigazione lasciata dallo screener.
+
+    DEVE girare prima che venga istanziato qualunque widget: Streamlit vieta di
+    modificare `st.session_state[k]` quando `k` e' la chiave di un widget gia'
+    creato nello stesso run, e solleverebbe StreamlitAPIException. Qui siamo
+    all'inizio del run successivo, quindi la scrittura e' legittima e il radio
+    la leggera' come valore iniziale.
+    """
+    if ui_scanner.NAV_TICKER in st.session_state:
+        st.session_state["ticker_input"] = st.session_state.pop(ui_scanner.NAV_TICKER)
+        st.session_state["modalita"] = ui_scanner.MODALITA_SINGOLO
+
+    st.session_state.setdefault("modalita", MODALITA[0])
+    st.session_state.setdefault("ticker_input", "SPY.US")
+    # Filtri e parametri dello screener: vanno tenuti idratati mentre lo screener
+    # non e' a schermo, perche' Streamlit ne elimina lo stato appena i widget
+    # smettono di essere renderizzati.
+    ui_scanner.ripristina_impostazioni(
+        screener_attivo=st.session_state["modalita"] == MODALITA[1]
+    )
+
+
 def main() -> None:
     api_key = D.get_api_key()
+    _applica_navigazione_pendente()
 
     with st.sidebar:
         st.markdown("## 🔬 Kriterion Quant")
         st.markdown("**Percentile & Anomaly Dashboard**")
         st.markdown("---")
 
-        modalita = st.radio(
-            "Modalità",
-            ["🔍 Screener multi-asset", "📈 Analisi singolo asset"],
-            key="modalita",
-        )
+        modalita = st.radio("Modalità", MODALITA, key="modalita")
 
         st.markdown("---")
 
-        if modalita == "📈 Analisi singolo asset":
+        if modalita == MODALITA[0]:
             st.header("⚙️ Parametri")
 
+            # Niente `value=`: il valore iniziale arriva da session_state, che e'
+            # anche il canale usato dal pulsante "Apri analisi completa" dello
+            # screener. Passare entrambi farebbe emettere a Streamlit un warning
+            # di conflitto fra default del widget e Session State API.
             ticker = st.text_input(
                 "Ticker (formato EODHD)",
-                value=st.session_state.get("ticker_input", "SPY.US"),
                 key="ticker_input",
                 placeholder="es. SPY.US, BTC-USD.CC",
                 help="Formato SIMBOLO.EXCHANGE — es. AAPL.US, ENI.MI, GSPC.INDX, BTC-USD.CC",
@@ -89,7 +119,7 @@ def main() -> None:
             lookahead_days = pct_tolerance = n_bootstrap = None
 
         st.markdown("---")
-        if st.button("🔄 Ricarica dati", use_container_width=True):
+        if st.button("🔄 Ricarica dati", width="stretch"):
             st.cache_data.clear()
             st.rerun()
 
@@ -107,11 +137,11 @@ def main() -> None:
         - **Screener**: metrica primaria cross-sectional, non time-series
         """)
 
-    if modalita == "🔍 Screener multi-asset":
-        ui_scanner.render(api_key)
-    else:
+    if modalita == MODALITA[0]:
         ui_single.render(api_key, ticker, start_date,
                          lookahead_days, pct_tolerance, n_bootstrap)
+    else:
+        ui_scanner.render(api_key)
 
     st.markdown("---")
     st.caption("🔬 **Kriterion Quant** — Percentile & Anomaly Dashboard | Dati: EODHD API")
