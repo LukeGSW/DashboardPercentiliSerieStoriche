@@ -1,4 +1,6 @@
-streamlit>=1.35.0
+# width="stretch"/"content" richiede Streamlit >= 1.49
+# (use_container_width e' deprecato e viene rimosso dopo il 2025-12-31)
+streamlit>=1.49.0
 pandas>=2.0.0
 numpy>=1.26.0
 plotly>=5.20.0
