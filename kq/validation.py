@@ -253,6 +253,12 @@ def newey_west_tstat(x: np.ndarray, lag: int) -> float:
     if n < 10:
         return np.nan
 
+    # Il numero di ritardi non puo' avvicinarsi alla lunghezza della serie:
+    # con holding lungo e poche date (es. holding 120 su 28 osservazioni) il
+    # lag richiesto sarebbe 24 su 28 punti, e lo stimatore degenera producendo
+    # t assurdi. Si tronca a n/4, la regola pratica usuale.
+    lag = max(1, min(int(lag), n // 4))
+
     mu = x.mean()
     e = x - mu
     s = float(e @ e) / n
