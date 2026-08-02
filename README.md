@@ -6,12 +6,13 @@ Parte del progetto **[Kriterion Quant](https://kriterionquant.com)** — piattaf
 
 ## 🎯 Scopo
 
-Dashboard Streamlit in due modalità complementari:
+Dashboard Streamlit in tre modalità complementari:
 
 | Modalità | Cosa fa |
 |---|---|
-| 🔍 **Screener multi-asset** | Filtro di primo livello su ~650 strumenti USA liquidi e optionable. Produce una **lista di candidati**, non verdetti. |
 | 📈 **Analisi singolo asset** | Lo studio completo su un ticker: percentili stagionali, z-score, dinamiche dell'anomalia, regime clustering, forward returns condizionali. |
+| 🔍 **Screener multi-asset** | Filtro di primo livello su ~650 strumenti USA liquidi e optionable. Produce una **lista di candidati**, non verdetti. |
+| 🧪 **Validazione setup** | Misura storicamente i setup dello screener contro un null, walk-forward e al netto dei costi. |
 
 Il flusso naturale è **screener → scegli un candidato → analisi completa**. Ogni riga della tabella dello screener ha un pulsante che apre direttamente l'analisi approfondita di quel ticker.
 
@@ -48,6 +49,43 @@ A questi si affianca un flag indipendente sul regime di volatilità realizzata (
 ### Cosa lo screener NON fa
 
 Lo `Score` è un'**euristica di ordinamento** trasparente e decomponibile (i pesi delle cinque componenti sono visibili per ogni candidato), **non** un edge validato: nessun backtest, nessun confronto con un null, nessun costo di transazione. La validazione si fa a valle, sul singolo candidato.
+
+---
+
+## 🧪 Validazione walk-forward
+
+Risponde a una domanda sola: quando lo screener ha segnalato un nome, nelle sedute successive quel nome ha fatto meglio di una selezione casuale fatta **lo stesso giorno sullo stesso universo**?
+
+### Il null
+
+Non è l'entrata casuale nel tempo. I setup di mean reversion scattano in modo sproporzionato durante i drawdown: confrontarli con entrate distribuite su tutto il periodo significherebbe accreditare al segnale il recupero del mercato. Il null è la **sezione trasversale contemporanea** — stesse date, stesso holding, nomi estratti dallo stesso universo eleggibile quel giorno:
+
+```
+extra_t = media(forward dei segnalati) − media(forward dell'universo)
+```
+
+che è anche il rendimento di una posizione equipesata long sui segnalati contro l'universo. Toglie beta ed effetto periodo in un colpo solo, ed è il valore atteso di una selezione casuale di pari numerosità.
+
+A questo si affianca una **banda placebo**: si ripete la selezione con nomi presi davvero a caso, stessa numerosità e stesse date. Un extra dentro quella banda non è un segnale, è quello che produce il caso.
+
+### Garanzie metodologiche
+
+| | |
+|---|---|
+| **Causalità** | Ogni grandezza usa finestre mobili o espandenti: alla data *t* solo dati fino a *t*. Verificato da test: troncando il futuro i segnali non cambiano di un bit. |
+| **Esecuzione ritardata** | Si entra alla chiusura di *t+1*, si esce a *t+1+holding*. |
+| **Sovrapposizione** | Newey-West con lag pari al rapporto holding/frequenza. Campionando ogni 5 sedute con holding 20, il *t* ingenuo sarebbe gonfiato del doppio. |
+| **Test multipli** | Benjamini-Hochberg su tutte le celle testate (4 setup × livelli × orizzonti). |
+| **Costi** | Andata+ritorno configurabile. **L'inferenza gira sul lordo**, il netto è il risultato economico: il costo è uno spostamento deterministico e sottrarlo prima del test gonfierebbe il \|t\| in proporzione al costo ipotizzato. |
+| **Stabilità** | Split 2/3 – 1/3. Non essendoci parametri stimati sui dati (le soglie sono costanti fissate a priori), misura persistenza nel tempo, non protegge da overfitting. |
+
+Il semaforo richiede **due** condizioni distinte: il segnale deve distinguersi dalla selezione casuale (domanda statistica, sul lordo) *e* deve restare qualcosa dopo i costi (domanda economica). Un segnale reale ma più piccolo dei costi non è operativo; un extra netto positivo ma indistinguibile dal caso non è un segnale.
+
+### Il limite che non si può togliere
+
+L'universo è costruito sui membri di oggi. Le società dislocate che sono risalite ci sono; quelle andate a zero sono uscite e non compaiono da nessuna parte. **Il bias spinge a favore della tesi contrarian**: un risultato positivo su `MR-LONG` va letto come **limite superiore**, non come stima.
+
+Il modulo riporta la **copertura** (quota di segnalati con un forward calcolabile) proprio per rendere visibile quanto il problema sia invisibile: se è ~100%, nel campione non fallisce mai nessuno. Per trasformarlo in una stima servirebbero la membership storica point-in-time e i prezzi dei delistati.
 
 ---
 
@@ -132,16 +170,19 @@ L'app non usa parquet precomputati: al primo avvio scarica l'universo. Con ~650 
 
 ```
 .
-├── app.py                  # entry point: sidebar, routing fra le due modalità
+├── app.py                  # entry point: sidebar, routing fra le tre modalità
 ├── kq/
 │   ├── config.py           # costanti, palette, soglie, universo ETF curato
 │   ├── data.py             # EODHD, rate limiting, download multi-thread, cache
 │   ├── universe.py         # costruzione universo, assegnazione benchmark
 │   ├── core.py             # analitiche single-asset (percentili, regime, forward)
 │   ├── scanner.py          # motore dello screener cross-sectional
+│   ├── validation.py       # event study walk-forward, null, Newey-West, BH
+│   ├── state.py            # persistenza impostazioni fra le modalità
 │   ├── charts.py           # costruttori Plotly
 │   ├── ui_single.py        # interfaccia analisi single-asset
-│   └── ui_scanner.py       # interfaccia screener
+│   ├── ui_scanner.py       # interfaccia screener
+│   └── ui_validation.py    # interfaccia validazione
 ├── requirements.txt
 └── README.md
 ```
