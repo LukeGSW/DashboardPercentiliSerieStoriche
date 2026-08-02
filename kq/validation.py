@@ -43,6 +43,8 @@ per rendere visibile quanto il problema sia invisibile in questi dati.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -376,20 +378,23 @@ def placebo_band(fwd_reb: pd.DataFrame, eleggibili_reb: pd.DataFrame,
     E = eleggibili_reb.reindex(valide).to_numpy(dtype=bool)
     k = conteggi.reindex(valide).to_numpy(dtype=int)
 
-    with np.errstate(invalid="ignore"):
+    # Una riga puo' non avere alcun forward calcolabile (fine campione): nanmean
+    # su una fetta tutta NaN emette un RuntimeWarning ed e' corretto restituire
+    # NaN, che viene poi ignorato dall'aggregazione. Si silenzia il rumore.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
         media_universo = np.nanmean(np.where(E, F, np.nan), axis=1)
 
-    rng = np.random.default_rng(seed)
-    esiti = np.empty(n_rip)
-    for i in range(n_rip):
-        r = rng.random(F.shape)
-        r[~E] = np.inf
-        # posizione di ciascun ticker in un ordinamento casuale fra gli eleggibili
-        posizione = np.argsort(np.argsort(r, axis=1), axis=1)
-        scelti = posizione < k[:, None]
-        with np.errstate(invalid="ignore"):
+        rng = np.random.default_rng(seed)
+        esiti = np.empty(n_rip)
+        for i in range(n_rip):
+            r = rng.random(F.shape)
+            r[~E] = np.inf
+            # posizione di ciascun ticker in un ordinamento casuale fra gli eleggibili
+            posizione = np.argsort(np.argsort(r, axis=1), axis=1)
+            scelti = posizione < k[:, None]
             media_scelti = np.nanmean(np.where(scelti, F, np.nan), axis=1)
-        esiti[i] = np.nanmean(media_scelti - media_universo)
+            esiti[i] = np.nanmean(media_scelti - media_universo)
 
     return {
         "media": float(np.nanmean(esiti) * 100),
