@@ -33,6 +33,7 @@ BIAS ACCETTATO (esplicito):
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -213,14 +214,27 @@ def assign_benchmarks_by_correlation(
     for b in bench_cols:
         corr[b] = sub.corrwith(recent[b])
 
-    best = corr.idxmax(axis=1)
-    best_val = corr.max(axis=1)
+    # Una riga puo' essere INTERAMENTE NaN: succede quando la serie del titolo
+    # ha varianza nulla (titolo sospeso di cui EODHD riporta lo stesso prezzo
+    # giorno dopo giorno) o non ha dati nella finestra. In quel caso corrwith
+    # divide per zero e restituisce NaN contro ogni benchmark, e idxmax
+    # solleverebbe "Encountered all NA values" facendo cadere tutta la pagina.
+    # Questi titoli vengono comunque scartati dopo dai controlli qualita':
+    # qui basta assegnare loro il benchmark di default e proseguire.
+    calcolabile = corr.notna().any(axis=1)
 
-    # Se nessun settoriale spiega il titolo in modo decente, resta su SPY
-    best = best.where(best_val >= 0.30, f"{C.DEFAULT_BENCHMARK}.US")
+    best = pd.Series(f"{C.DEFAULT_BENCHMARK}.US", index=corr.index, dtype=object)
+    best_val = pd.Series(np.nan, index=corr.index, dtype=float)
 
-    out.loc[out["ticker"].isin(best.index), "benchmark"] = (
-        out.loc[out["ticker"].isin(best.index), "ticker"].map(best)
-    )
+    if calcolabile.any():
+        sub_corr = corr.loc[calcolabile]
+        vincitore = sub_corr.idxmax(axis=1)
+        valore = sub_corr.max(axis=1)
+        # Se nessun settoriale spiega il titolo in modo decente, resta su SPY
+        best.loc[calcolabile] = vincitore.where(valore >= 0.30, f"{C.DEFAULT_BENCHMARK}.US")
+        best_val.loc[calcolabile] = valore
+
+    mappa = out["ticker"].map(best)
+    out["benchmark"] = mappa.fillna(out["benchmark"])
     out["corr_benchmark"] = out["ticker"].map(best_val)
     return out
