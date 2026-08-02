@@ -33,18 +33,24 @@ Un titolo giù del 20% non è dislocato se il suo settore è giù del 18%: è be
 **3. La direzione si misura con il momentum residuo, non con la velocity di rank.**
 Il rank percentile è limitato in [0, 100] e **satura**: un titolo già all'ultimo posto ha velocity esattamente zero proprio mentre sta crollando, e verrebbe letto come "stabilizzato". Il momentum residuo di breve è continuo e non limitato, quindi separa davvero *ha smesso di scendere* da *è già in fondo*.
 
-### I quattro setup
+### I quattro stati — e perché il nome non dice la strategia
 
-Nascono dall'incrocio di due assi ortogonali — **ampiezza** della dislocazione e **direzione** attuale — e sono esaustivi e mutuamente esclusivi:
+Gli stati nascono dall'incrocio di due assi ortogonali (**ampiezza** della dislocazione e **verso** attuale del movimento) e sono esaustivi e mutuamente esclusivi. Descrivono una **condizione osservata**, non una tesi: la direzione operativa arriva dalla validazione e vive in `config.SETUP_VERDETTO`.
 
-| Setup | Significato |
-|---|---|
-| `MR-LONG` | Dislocato sotto il benchmark, ma **ha smesso** di peggiorare |
-| `TREND-DN` | Dislocato sotto e **ancora in caduta** — non è un rimbalzo |
-| `MR-SHORT` | Dislocato sopra, ma **ha smesso** di salire |
-| `TREND-UP` | Dislocato sopra e **ancora in corsa** |
+| Stato | Condizione | Azione | Evidenza |
+|---|---|---|---|
+| `↑↑ ESTESO` | Dislocato sopra, **ancora in accelerazione** | **RIBASSISTA** | confermata |
+| `↑ ESAURITO` | Dislocato sopra, momentum esaurito | RIBASSISTA | debole |
+| `↓ STABILIZZATO` | Dislocato sotto, **ha smesso** di scendere | nessuna | assente |
+| `↓↓ IN CADUTA` | Dislocato sotto, ancora in caduta | nessuna | instabile |
 
-A questi si affianca un flag indipendente sul regime di volatilità realizzata (`COMPRESSA` / `RICCA`) e la struttura in opzioni coerente con la combinazione setup × volatilità.
+**Sì, gli strumenti estesi al rialzo si trattano al ribasso.** L'event study (84 celle, 7 orizzonti) lo misura: `↑↑ ESTESO` sottoperforma l'universo su 7 orizzonti su 7, con dose-risposta sia sulla selettività sia sull'orizzonte e out-of-sample più forte dell'in-sample (~−6%/anno a 20 sedute, t −2,48, q 0,105). Sui dislocati al ribasso non c'è invece nulla — ed è una conclusione robusta, perché il survivorship bias gonfia proprio quella tesi e nemmeno così emerge qualcosa.
+
+> ⚠️ La direzione di `↑↑ ESTESO` è stata fissata **dopo** aver visto quei dati. È un'ipotesi da confermare in avanti, non un risultato out-of-sample — e l'app lo dichiara in cima alla tabella della validazione.
+
+Il regime di volatilità realizzata (`COMPRESSA` / `RICCA`) è un flag **indipendente**: la colonna `Struttura` incrocia azione validata × volatilità, e per gli stati senza azione propone solo strutture sulla volatilità.
+
+Per aggiornare il verdetto dopo un nuovo studio si modifica la sola tabella `SETUP_VERDETTO`: colonne, strutture in opzioni e segno della tesi nell'event study seguono da soli.
 
 ### Cosa lo screener NON fa
 
