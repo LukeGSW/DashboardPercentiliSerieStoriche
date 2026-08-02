@@ -75,6 +75,56 @@ def _grafico_extra(serie: pd.Series, titolo: str) -> go.Figure:
     return fig
 
 
+def _grafico_profilo(mis: pd.DataFrame) -> go.Figure:
+    """
+    Extra ANNUALIZZATO in funzione del periodo di detenzione.
+
+    È il grafico che serve per scegliere l'holding, e va letto annualizzato,
+    non per trade: l'extra per trade cresce quasi meccanicamente con l'holding
+    (più tempo, più rendimento accumulato), quindi confrontando per trade si
+    finirebbe sempre per prendere il più lungo. L'annualizzato incorpora invece
+    anche il costo, che si paga a ogni trade e quindi penalizza gli holding
+    corti: il massimo netto sta tipicamente a metà strada.
+
+    Un effetto vero disegna un profilo LISCIO che sale, picca e decade. Se il
+    segno sbatte da un holding all'altro, non c'è niente da temporizzare.
+    """
+    fig = go.Figure()
+    if mis.empty:
+        return fig
+
+    for (setup, livello), grp in mis.groupby(["Setup", "Livello"]):
+        g = grp.sort_values("Holding")
+        tratto = {"Alta convinzione": "solid", "Selettivo": "dash",
+                  "Tutti i candidati": "dot"}.get(livello, "solid")
+        fig.add_trace(go.Scatter(
+            x=g["Holding"], y=g["Extra annuo %"], mode="lines+markers",
+            name=f"{setup} · {livello}",
+            line=dict(color=C.SETUP_COLORS.get(setup, C.COLORS["neutral"]),
+                      width=2, dash=tratto),
+            marker=dict(size=7),
+            hovertemplate=("<b>%{fullData.name}</b><br>holding %{x} sedute"
+                           "<br>extra annuo %{y:.2f}%<extra></extra>"),
+        ))
+
+    fig.add_hline(y=0, line_color="rgba(255,255,255,0.4)")
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=C.COLORS["background"], plot_bgcolor=C.COLORS["background"],
+        height=440,
+        xaxis=dict(title="Periodo di detenzione (sedute)", type="log",
+                   gridcolor=C.COLORS["grid"],
+                   tickmode="array", tickvals=sorted(mis["Holding"].unique()),
+                   ticktext=[str(h) for h in sorted(mis["Holding"].unique())]),
+        yaxis=dict(title="Extra annualizzato, netto costi (%)",
+                   gridcolor=C.COLORS["grid"], ticksuffix="%"),
+        legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.01,
+                    font=dict(size=10)),
+        margin=dict(l=70, r=30, t=30, b=60),
+    )
+    return fig
+
+
 def _tabella(df: pd.DataFrame) -> None:
     cols = ["Setup", "Livello", "Holding", "Esito", "Extra %", "Extra lordo %",
             "Placebo p05 %", "Placebo p95 %", "t (NW)", "p (bootstrap)", "q (BH)",
@@ -266,6 +316,18 @@ def _mostra(out: pd.DataFrame, meta: dict) -> None:
     if len(mis) == 0:
         st.warning("Nessuna cella ha abbastanza osservazioni. Allunga la storia o allenta la selettività.")
         return
+
+    if mis["Holding"].nunique() > 1:
+        st.markdown("#### 📉 Profilo di decadimento")
+        st.caption(
+            "Come si sceglie il periodo di detenzione: si legge da qui, non da una cella "
+            "singola. Un effetto vero disegna una curva liscia che picca e decade; se il "
+            "segno sbatte da un holding all'altro non c'è niente da temporizzare. "
+            "L'asse Y è **annualizzato e netto costi**, non per trade: per trade l'extra "
+            "cresce quasi meccanicamente con l'holding e sceglieresti sempre il più lungo."
+        )
+        st.plotly_chart(_grafico_profilo(mis), width="stretch")
+        st.markdown("---")
 
     _tabella(mis.sort_values(["Esito", "Extra %"], ascending=[True, False]))
 
