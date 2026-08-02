@@ -37,12 +37,18 @@ st.set_page_config(
 from kq import data as D          # noqa: E402
 from kq import ui_scanner         # noqa: E402
 from kq import ui_single          # noqa: E402
+from kq import ui_validation      # noqa: E402
 
 
-# L'analisi singolo asset e' la prima voce, quindi il default: lo screener scarica
-# l'intero universo al primo avvio (~1 minuto) e non ha senso pagarlo a ogni
-# apertura dell'app. Si entra nello screener quando lo si vuole.
-MODALITA = ["📈 Analisi singolo asset", "🔍 Screener multi-asset"]
+# L'analisi singolo asset e' la prima voce, quindi il default: screener e
+# validazione scaricano l'intero universo al primo avvio (~1 minuto) e non ha
+# senso pagarlo a ogni apertura dell'app.
+SINGOLO, SCREENER, VALIDAZIONE = (
+    "📈 Analisi singolo asset",
+    "🔍 Screener multi-asset",
+    "🧪 Validazione setup",
+)
+MODALITA = [SINGOLO, SCREENER, VALIDAZIONE]
 
 
 def _applica_navigazione_pendente() -> None:
@@ -59,14 +65,14 @@ def _applica_navigazione_pendente() -> None:
         st.session_state["ticker_input"] = st.session_state.pop(ui_scanner.NAV_TICKER)
         st.session_state["modalita"] = ui_scanner.MODALITA_SINGOLO
 
-    st.session_state.setdefault("modalita", MODALITA[0])
+    st.session_state.setdefault("modalita", SINGOLO)
     st.session_state.setdefault("ticker_input", "SPY.US")
-    # Filtri e parametri dello screener: vanno tenuti idratati mentre lo screener
-    # non e' a schermo, perche' Streamlit ne elimina lo stato appena i widget
-    # smettono di essere renderizzati.
-    ui_scanner.ripristina_impostazioni(
-        screener_attivo=st.session_state["modalita"] == MODALITA[1]
-    )
+    # Filtri e parametri vanno tenuti idratati mentre la loro pagina non e' a
+    # schermo: Streamlit ne elimina lo stato appena i widget smettono di essere
+    # renderizzati, e senza questo tornerebbe tutto ai default a ogni cambio.
+    modalita = st.session_state["modalita"]
+    ui_scanner.ripristina_impostazioni(screener_attivo=modalita == SCREENER)
+    ui_validation.ripristina_impostazioni(pagina_attiva=modalita == VALIDAZIONE)
 
 
 def main() -> None:
@@ -82,7 +88,7 @@ def main() -> None:
 
         st.markdown("---")
 
-        if modalita == MODALITA[0]:
+        if modalita == SINGOLO:
             st.header("⚙️ Parametri")
 
             # Niente `value=`: il valore iniziale arriva da session_state, che e'
@@ -137,11 +143,13 @@ def main() -> None:
         - **Screener**: metrica primaria cross-sectional, non time-series
         """)
 
-    if modalita == MODALITA[0]:
+    if modalita == SINGOLO:
         ui_single.render(api_key, ticker, start_date,
                          lookahead_days, pct_tolerance, n_bootstrap)
-    else:
+    elif modalita == SCREENER:
         ui_scanner.render(api_key)
+    else:
+        ui_validation.render(api_key)
 
     st.markdown("---")
     st.caption("🔬 **Kriterion Quant** — Percentile & Anomaly Dashboard | Dati: EODHD API")
