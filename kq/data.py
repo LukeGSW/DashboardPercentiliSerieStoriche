@@ -271,10 +271,19 @@ def build_panel(raw: dict[str, pd.DataFrame], calendar_anchor: str = "SPY.US"):
     close = close.ffill(limit=3)
     volume = volume.fillna(0.0)
 
+    # Colonne senza alcun dato utile: capita quando il calendario del ticker non
+    # interseca quello dell'ancora. Lasciarle dentro propaga NaN in ogni calcolo
+    # a valle senza che nessun controllo le possa spiegare.
+    close = close.dropna(axis=1, how="all")
+    volume = volume.reindex(columns=close.columns)
+
     return close, volume
 
 
-@st.cache_data(ttl=3600, persist="disk", show_spinner=False)
+# NOTA: niente `ttl` su una cache persistente. Streamlit ignora il TTL quando
+# persist="disk" ed emette un warning a ogni avvio. La rotazione giornaliera e'
+# gia' garantita dal parametro `cache_day`, che cambia una volta al giorno.
+@st.cache_data(persist="disk", show_spinner=False)
 def load_screener_panel(
     tickers: tuple[str, ...],
     start_date: str,
